@@ -157,3 +157,13 @@ func WriteUint24(buf *bytes.Buffer, val uint32) {
 	WriteUint32(b, val)
 	buf.Write(b.Bytes()[1:])
 }
+
+// WriteUint16 is a convenience function that appends to the given buffer
+// 2 bytes containing the big-endian representation of the given uint16 value.
+// Caller is responsible to ensure the passed value does not overflow the
+// maximal capacity of 3 bytes.
+func WriteUint16(buf *bytes.Buffer, val uint32) {
+	b := &bytes.Buffer{}
+	WriteUint32(b, val)
+	buf.Write(b.Bytes()[2:])
+}

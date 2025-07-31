@@ -30,6 +30,8 @@ const (
 	P_CONTROL_HARD_RESET_CLIENT_V2                    // 7
 	P_CONTROL_HARD_RESET_SERVER_V2                    // 8
 	P_DATA_V2                                         // 9
+	P_CONTROL_HARD_RESET_CLIENT_V3                    // 10
+	P_CONTROL_WKC_V1                                  // 11
 )
 
 // NewOpcodeFromString returns an opcode from a string representation, and an error if it cannot parse the opcode
@@ -54,6 +56,10 @@ func NewOpcodeFromString(s string) (Opcode, error) {
 		return P_CONTROL_HARD_RESET_SERVER_V2, nil
 	case "DATA_V2":
 		return P_DATA_V2, nil
+	case "P_CONTROL_HARD_RESET_CLIENT_V3":
+		return P_CONTROL_HARD_RESET_CLIENT_V3, nil
+	case "P_CONTROL_WKC_V1":
+		return P_CONTROL_WKC_V1, nil
 	default:
 		return 0, errors.New("unknown opcode")
 	}
@@ -89,6 +95,12 @@ func (op Opcode) String() string {
 	case P_DATA_V2:
 		return "P_DATA_V2"
 
+	case P_CONTROL_HARD_RESET_CLIENT_V3:
+		return "P_CONTROL_HARD_RESET_CLIENT_V3"
+
+	case P_CONTROL_WKC_V1:
+		return "P_CONTROL_WKC_V1"
+
 	default:
 		return "P_UNKNOWN"
 	}
@@ -102,6 +114,8 @@ func (op Opcode) IsControl() bool {
 		P_CONTROL_SOFT_RESET_V1,
 		P_CONTROL_V1,
 		P_CONTROL_HARD_RESET_CLIENT_V2,
+		P_CONTROL_HARD_RESET_CLIENT_V3,
+		P_CONTROL_WKC_V1,
 		P_CONTROL_HARD_RESET_SERVER_V2:
 		return true
 	default:
@@ -128,6 +142,9 @@ type PacketID uint32
 // PeerID is the type of the P_DATA_V2 peer ID.
 type PeerID [3]byte
 
+// Optional timestamp field used for tls-auth (seconds since the epoch).
+type PacketTimestamp uint32
+
 // Packet is an OpenVPN packet.
 type Packet struct {
 	// Opcode is the packet message type (a P_* constant; high 5-bits of
@@ -145,17 +162,20 @@ type Packet struct {
 	// LocalSessionID is the local session ID.
 	LocalSessionID SessionID
 
+	// An additional packet id used for replay protection in tls-auth mode ONLY. A seperate
+	// counter is used that additional includes p_ACK packets.
+	ReplayPacketID PacketID
+
+	// Optional timestamp field used for tls-auth (seconds since the epoch).
+	Timestamp PacketTimestamp
+
 	// Acks contains the remote packets we're ACKing.
 	ACKs []PacketID
 
 	// RemoteSessionID is the remote session ID.
 	RemoteSessionID SessionID
 
-	// ID is the packet-id for replay protection. According to the spec: "4 or 8 bytes,
-	// includes sequence number and optional time_t timestamp".
-	//
-	// This library does not use the timestamp.
-	// TODO(ainghazal): use optional.Value (only control packets have packet id)
+	// message packet-id (4 bytes).
 	ID PacketID
 
 	// Payload is the packet's payload.

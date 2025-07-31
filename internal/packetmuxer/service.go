@@ -8,13 +8,12 @@ import (
 
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/session"
+	"github.com/ooni/minivpn/internal/wire"
 	"github.com/ooni/minivpn/internal/workers"
 	"github.com/ooni/minivpn/pkg/config"
 )
 
-var (
-	serviceName = "packetmuxer"
-)
+var serviceName = "packetmuxer"
 
 const (
 	// A sufficiently long wakup period to initialize a ticker with.
@@ -178,7 +177,7 @@ func (ws *workersState) moveDownWorker() {
 		select {
 		case packet := <-ws.dataOrControlToMuxer:
 			// serialize the packet
-			rawPacket, err := packet.Bytes()
+			rawPacket, err := wire.MarshalPacket(packet, ws.sessionManager.PacketAuth())
 			if err != nil {
 				ws.logger.Warnf("%s: cannot serialize packet: %s", workerName, err.Error())
 				continue
@@ -238,7 +237,7 @@ func (ws *workersState) startHardReset() error {
 // handleRawPacket is the code invoked to handle a raw packet.
 func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 	// make sense of the packet
-	packet, err := model.ParsePacket(rawPacket)
+	packet, err := wire.UnmarshalPacket(rawPacket, ws.sessionManager.PacketAuth())
 	if err != nil {
 		ws.logger.Warnf("packetmuxer: moveUpWorker: ParsePacket: %s", err.Error())
 		return nil // keep running
@@ -341,7 +340,7 @@ func (ws *workersState) finishThreeWayHandshake(packet *model.Packet) error {
 // serializeAndEmit will write a serialized packet on the channel going down to the networkio layer.
 func (ws *workersState) serializeAndEmit(packet *model.Packet) error {
 	// serialize it
-	rawPacket, err := packet.Bytes()
+	rawPacket, err := wire.MarshalPacket(packet, ws.sessionManager.PacketAuth())
 	if err != nil {
 		return err
 	}

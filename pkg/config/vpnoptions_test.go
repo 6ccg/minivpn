@@ -12,6 +12,7 @@ func writeDummyCertFiles(d string) {
 	os.WriteFile(fp.Join(d, "ca.crt"), []byte("dummy"), 0600)
 	os.WriteFile(fp.Join(d, "cert.pem"), []byte("dummy"), 0600)
 	os.WriteFile(fp.Join(d, "key.pem"), []byte("dummy"), 0600)
+	os.WriteFile(fp.Join(d, "ta.pem"), []byte("dummy"), 0600)
 }
 
 func TestOptions_String(t *testing.T) {
@@ -24,6 +25,7 @@ func TestOptions_String(t *testing.T) {
 		CA        string
 		Cert      string
 		Key       string
+		TLSAuth   string
 		Cipher    string
 		Auth      string
 		TLSMaxVer string
@@ -74,19 +76,20 @@ func TestOptions_String(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			o := &OpenVPNOptions{
-				Remote:     tt.fields.Remote,
-				Port:       tt.fields.Port,
-				Proto:      tt.fields.Proto,
-				Username:   tt.fields.Username,
-				Password:   tt.fields.Password,
-				CAPath:     tt.fields.CA,
-				CertPath:   tt.fields.Cert,
-				KeyPath:    tt.fields.Key,
-				Compress:   tt.fields.Compress,
-				Cipher:     tt.fields.Cipher,
-				Auth:       tt.fields.Auth,
-				TLSMaxVer:  tt.fields.TLSMaxVer,
-				ProxyOBFS4: tt.fields.ProxyOBFS4,
+				Remote:      tt.fields.Remote,
+				Port:        tt.fields.Port,
+				Proto:       tt.fields.Proto,
+				Username:    tt.fields.Username,
+				Password:    tt.fields.Password,
+				CAPath:      tt.fields.CA,
+				CertPath:    tt.fields.Cert,
+				KeyPath:     tt.fields.Key,
+				TLSAuthPath: tt.fields.TLSAuth,
+				Compress:    tt.fields.Compress,
+				Cipher:      tt.fields.Cipher,
+				Auth:        tt.fields.Auth,
+				TLSMaxVer:   tt.fields.TLSMaxVer,
+				ProxyOBFS4:  tt.fields.ProxyOBFS4,
 			}
 			if got := o.ServerOptionsString(); got != tt.want {
 				t.Errorf("Options.string() = %v, want %v", got, tt.want)
@@ -104,7 +107,8 @@ func TestGetOptionsFromLines(t *testing.T) {
 			"auth SHA512",
 			"ca ca.crt",
 			"cert cert.pem",
-			"key cert.pem",
+			"key key.pem",
+			"tls-auth ta.pem",
 		}
 		writeDummyCertFiles(d)
 		opt, err := getOptionsFromLines(l, d)
@@ -135,6 +139,9 @@ func TestGetOptionsFromLinesInlineCerts(t *testing.T) {
 			"<key>",
 			"key_string",
 			"</key>",
+			"<tls-auth>",
+			"ta_string",
+			"</tls-auth>",
 		}
 		o, err := getOptionsFromLines(l, "")
 		if err != nil {
@@ -148,6 +155,9 @@ func TestGetOptionsFromLinesInlineCerts(t *testing.T) {
 		}
 		if string(o.Key) != "key_string\n" {
 			t.Errorf("Expected key_string, got: %s.", string(o.Key))
+		}
+		if string(o.TLSAuth) != "ta_string\n" {
+			t.Errorf("Expected ta_string, got: %s.", string(o.Key))
 		}
 	})
 }
@@ -292,7 +302,6 @@ func Test_ParseConfigFile(t *testing.T) {
 		if _, err := ReadConfigFile(""); err == nil {
 			t.Errorf("expected error with empty file")
 		}
-
 	})
 
 	t.Run("an http uri should fail", func(t *testing.T) {
@@ -412,7 +421,7 @@ func Test_parseCert(t *testing.T) {
 
 	t.Run("non-existent cert should fail", func(t *testing.T) {
 		_, err := parseCert([]string{"/tmp/nonexistent"}, &OpenVPNOptions{}, "")
-		var wantErr = ErrBadConfig
+		wantErr := ErrBadConfig
 		if !errors.Is(err, wantErr) {
 			t.Errorf("parseCert(): want %v, got %v", wantErr, err)
 		}
@@ -445,6 +454,24 @@ func Test_parseKey(t *testing.T) {
 	})
 }
 
+func Test_parseTLSAuth(t *testing.T) {
+	t.Run("more than one part should fail", func(t *testing.T) {
+		_, err := parseTLSAuth([]string{"one", "two"}, &OpenVPNOptions{}, "")
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseCA(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("empty part should fail", func(t *testing.T) {
+		_, err := parseTLSAuth([]string{}, &OpenVPNOptions{}, "")
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseCA(): want %v, got %v", wantErr, err)
+		}
+	})
+}
+
 func Test_parseCompress(t *testing.T) {
 	t.Run("more than one part should fail", func(t *testing.T) {
 		_, err := parseCompress([]string{"one", "two"}, &OpenVPNOptions{})
@@ -471,7 +498,6 @@ func Test_parseOption(t *testing.T) {
 		if err != nil {
 			t.Errorf("parseOption(): want %v, got %v", nil, err)
 		}
-
 	})
 }
 
@@ -516,7 +542,6 @@ func Test_parseAuth(t *testing.T) {
 			if _, err := parseAuth(tt.args.p, tt.args.o); !errors.Is(err, tt.wantErr) {
 				t.Errorf("parseAuth() error = %v, wantErr %v", err, tt.wantErr)
 			}
-
 		})
 	}
 }

@@ -4,13 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/optional"
 	"github.com/ooni/minivpn/internal/runtimex"
+	"github.com/ooni/minivpn/internal/wire"
 	"github.com/ooni/minivpn/pkg/config"
 )
 
@@ -38,6 +41,10 @@ type Manager struct {
 	tunnelInfo           model.TunnelInfo
 	tracer               model.HandshakeTracer
 
+	// Additional state required to support tls-auth
+	controlChannelSecurity     *wire.ControlChannelSecurity
+	localControlReplayPacketID model.PacketID
+
 	// Ready is a channel where we signal that we can start accepting data, because we've
 	// successfully generated key material for the data channel.
 	Ready chan any
@@ -49,6 +56,7 @@ type Manager struct {
 // NewManager returns a [Manager] ready to be used.
 func NewManager(config *config.Config) (*Manager, error) {
 	key0 := &DataChannelKey{}
+
 	sessionManager := &Manager{
 		keyID: 0,
 		keys:  []*DataChannelKey{key0},
@@ -88,6 +96,55 @@ func NewManager(config *config.Config) (*Manager, error) {
 		return sessionManager, err
 	}
 	k.AddLocalKey(localKey)
+
+	// Need to load tls-auth from file
+	if len(config.OpenVPNOptions().TLSAuthPath) != 0 {
+		authData, err := os.ReadFile(config.OpenVPNOptions().TLSAuthPath)
+		if err != nil {
+			return sessionManager, err
+		}
+
+		// TODO: provide ability to pass in key direction
+		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSAuth(authData, 1)
+		if err != nil {
+			return sessionManager, err
+		}
+
+		// replay packet id starts at 1 but is offset here becuase the first packet is always a hard reset packet which is hardcoded to 1
+		sessionManager.localControlReplayPacketID = 2
+	} else if len(config.OpenVPNOptions().TLSCryptPath) != 0 {
+		authData, err := os.ReadFile(config.OpenVPNOptions().TLSCryptPath)
+		if err != nil {
+			return sessionManager, err
+		}
+
+		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSCrypt(authData)
+		if err != nil {
+			return sessionManager, err
+		}
+
+		// replay packet id starts at 1 but is offset here becuase the first packet is always a hard reset packet which is hardcoded to 1
+		sessionManager.localControlReplayPacketID = 2
+	} else if len(config.OpenVPNOptions().TLSCryptV2Path) != 0 {
+		authData, err := os.ReadFile(config.OpenVPNOptions().TLSCryptV2Path)
+		if err != nil {
+			return sessionManager, err
+		}
+
+		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSCryptV2(authData)
+		if err != nil {
+			return sessionManager, err
+		}
+
+		// replay packet id starts at 1 but is offset here becuase the first packet is always a hard reset packet which is hardcoded to 1
+		sessionManager.localControlReplayPacketID = 2
+	} else {
+		sessionManager.controlChannelSecurity = &wire.ControlChannelSecurity{
+			Mode: wire.ControlSecurityModeNone,
+		}
+
+	}
+
 	return sessionManager, nil
 }
 
@@ -124,6 +181,7 @@ func (m *Manager) NewACKForPacketIDs(ids []model.PacketID) (*model.Packet, error
 	if m.remoteSessionID.IsNone() {
 		return nil, ErrNoRemoteSessionID
 	}
+	// TODO: Could this use NewPacket() instead ?
 	p := &model.Packet{
 		Opcode:          model.P_ACK_V1,
 		KeyID:           m.keyID,
@@ -133,6 +191,15 @@ func (m *Manager) NewACKForPacketIDs(ids []model.PacketID) (*model.Packet, error
 		RemoteSessionID: m.remoteSessionID.Unwrap(),
 		ID:              0,
 		Payload:         []byte{},
+	}
+
+	if m.controlChannelSecurity.Mode != wire.ControlSecurityModeNone {
+		replayId, err := m.localControlReplayPacketIDLocked()
+		if err != nil {
+			return nil, err
+		}
+		p.ReplayPacketID = replayId
+		p.Timestamp = model.PacketTimestamp(time.Now().Unix())
 	}
 	return p, nil
 }
@@ -160,6 +227,15 @@ func (m *Manager) NewPacket(opcode model.Opcode, payload []byte) (*model.Packet,
 	if !m.remoteSessionID.IsNone() {
 		packet.RemoteSessionID = m.remoteSessionID.Unwrap()
 	}
+
+	if m.controlChannelSecurity.Mode != wire.ControlSecurityModeNone {
+		replayId, err := m.localControlReplayPacketIDLocked()
+		if err != nil {
+			return nil, err
+		}
+		packet.ReplayPacketID = replayId
+		packet.Timestamp = model.PacketTimestamp(time.Now().Unix())
+	}
 	return packet, nil
 }
 
@@ -168,8 +244,14 @@ func (m *Manager) NewPacket(opcode model.Opcode, payload []byte) (*model.Packet,
 // its packet ID. Normally retransmission is handled at the reliabletransport layer,
 // but we send hard resets at the muxer.
 func (m *Manager) NewHardResetPacket() *model.Packet {
+	var opcode model.Opcode
+	if m.controlChannelSecurity.Mode == wire.ControlSecurityModeTLSCryptV2 {
+		opcode = model.P_CONTROL_HARD_RESET_CLIENT_V3
+	} else {
+		opcode = model.P_CONTROL_HARD_RESET_CLIENT_V2
+	}
 	packet := model.NewPacket(
-		model.P_CONTROL_HARD_RESET_CLIENT_V2,
+		opcode,
 		m.keyID,
 		[]byte{},
 	)
@@ -177,6 +259,12 @@ func (m *Manager) NewHardResetPacket() *model.Packet {
 	// a hard reset will always have packet ID zero
 	packet.ID = 0
 	copy(packet.LocalSessionID[:], m.localSessionID[:])
+
+	// additional fields required by tls-auth mode
+	if m.controlChannelSecurity.Mode != wire.ControlSecurityModeNone {
+		packet.Timestamp = model.PacketTimestamp(time.Now().Unix())
+		packet.ReplayPacketID = 1 // Always 1 for a reset???
+	}
 	return packet
 }
 
@@ -362,4 +450,22 @@ func (m *Manager) TunnelInfo() model.TunnelInfo {
 		NetMask: m.tunnelInfo.NetMask,
 		PeerID:  m.tunnelInfo.PeerID,
 	}
+}
+
+// Defines how control packets are authenticated (e.g. tls-auth)
+func (m *Manager) PacketAuth() *wire.ControlChannelSecurity {
+	return m.controlChannelSecurity
+}
+
+// Very similar to the localControlPacketID, but includes ACKs as well
+func (m *Manager) localControlReplayPacketIDLocked() (model.PacketID, error) {
+	pid := m.localControlReplayPacketID
+
+	// TODO, should we have a seperate error for this case??
+	if pid == math.MaxUint32 {
+		// we reached the max packetID, increment will overflow
+		return 0, ErrExpiredKey
+	}
+	m.localControlReplayPacketID++
+	return pid, nil
 }

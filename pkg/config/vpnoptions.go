@@ -1,33 +1,5 @@
 package config
 
-//
-// Parse VPN options.
-//
-// Mostly, this file conforms to the format in the reference implementation.
-// However, there are some additions that are specific. To avoid feature creep
-// and fat dependencies, the internal implementation only supports mainline
-// capabilities. It is still useful to carry all options in a single type,
-// so it's up to the user of this library to do something useful with
-// such options. The `extra` package provides some of these extra features, like
-// obfuscation support.
-//
-// Following the configuration format in the reference implementation, `minivpn`
-// allows including files in the main configuration file, but only for the `ca`,
-// `cert` and `key` options.
-//
-// Each inline file is started by the line <option> and ended by the line
-// </option>.
-//
-// Here is an example of an inline file usage:
-//
-// ```
-// <cert>
-// -----BEGIN CERTIFICATE-----
-// [...]
-// -----END CERTIFICATE-----
-// </cert>
-// ```
-
 import (
 	"bufio"
 	"bytes"
@@ -98,20 +70,26 @@ var SupportedAuth = []string{
 // different modules that need it.
 type OpenVPNOptions struct {
 	// These options have the same name of OpenVPN options referenced in the official documentation:
-	Remote    string
-	Port      string
-	Proto     Proto
-	Username  string
-	Password  string
-	CAPath    string
-	CertPath  string
-	KeyPath   string
-	CA        []byte
-	Cert      []byte
-	Key       []byte
-	Cipher    string
-	Auth      string
-	TLSMaxVer string
+	Remote         string
+	Port           string
+	Proto          Proto
+	Username       string
+	Password       string
+	CAPath         string
+	CertPath       string
+	KeyPath        string
+	TLSAuthPath    string
+	TLSCryptPath   string
+	TLSCryptV2Path string
+	CA             []byte
+	Cert           []byte
+	Key            []byte
+	TLSAuth        []byte
+	TLSCrypt       []byte
+	TLSCryptV2     []byte
+	Cipher         string
+	Auth           string
+	TLSMaxVer      string
 
 	// Below are options that do not conform strictly to the OpenVPN configuration format, but still can
 	// be understood by us in a configuration file:
@@ -279,6 +257,54 @@ func parseKey(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, e
 	return o, nil
 }
 
+func parseTLSAuth(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
+	e := fmt.Errorf("%w: %s", ErrBadConfig, "tls-auth expects a valid file")
+	if len(p) != 1 {
+		return o, e
+	}
+	tlsAuth := toAbs(p[0], basedir)
+	if sub, _ := isSubdir(basedir, tlsAuth); !sub {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-auth must be below config path")
+	}
+	if !existsFile(tlsAuth) {
+		return o, e
+	}
+	o.TLSAuthPath = tlsAuth
+	return o, nil
+}
+
+func parseTLSCrypt(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
+	e := fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt expects a valid file")
+	if len(p) != 1 {
+		return o, e
+	}
+	path := toAbs(p[0], basedir)
+	if sub, _ := isSubdir(basedir, path); !sub {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt must be below config path")
+	}
+	if !existsFile(path) {
+		return o, e
+	}
+	o.TLSCryptPath = path
+	return o, nil
+}
+
+func parseTLSCryptV2(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
+	e := fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt-v2 expects a valid file")
+	if len(p) != 1 {
+		return o, e
+	}
+	path := toAbs(p[0], basedir)
+	if sub, _ := isSubdir(basedir, path); !sub {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt-v2 must be below config path")
+	}
+	if !existsFile(path) {
+		return o, e
+	}
+	o.TLSCryptV2Path = path
+	return o, nil
+}
+
 // parseAuthUser reads credentials from a given file, according to the openvpn
 // format (user and pass on a line each). To avoid path traversal / LFI, the
 // credentials file is expected to be in a subdirectory of the base dir.
@@ -362,6 +388,9 @@ var pMapDir = map[string]interface{}{
 	"ca":             parseCA,
 	"cert":           parseCert,
 	"key":            parseKey,
+	"tls-auth":       parseTLSAuth,
+	"tls-crypt":      parseTLSCrypt,
+	"tls-crypt-v2":   parseTLSCryptV2,
 	"auth-user-pass": parseAuthUser,
 }
 
@@ -372,7 +401,7 @@ func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (
 		if updatedOpt, e := fn(p, opt); e != nil {
 			return updatedOpt, e
 		}
-	case "ca", "cert", "key", "auth-user-pass":
+	case "ca", "cert", "key", "tls-auth", "tls-crypt", "auth-user-pass":
 		fn := pMapDir[key].(func([]string, *OpenVPNOptions, string) (*OpenVPNOptions, error))
 		if updatedOpt, e := fn(p, opt, dir); e != nil {
 			return updatedOpt, e
@@ -388,22 +417,28 @@ func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (
 // format. The config file supports inline file inclusion for <ca>, <cert> and <key>.
 func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 	opt := &OpenVPNOptions{
-		Remote:     "",
-		Port:       "",
-		Proto:      ProtoTCP,
-		Username:   "",
-		Password:   "",
-		CAPath:     "",
-		CertPath:   "",
-		KeyPath:    "",
-		CA:         []byte{},
-		Cert:       []byte{},
-		Key:        []byte{},
-		Cipher:     "",
-		Auth:       "",
-		TLSMaxVer:  "",
-		Compress:   CompressionEmpty,
-		ProxyOBFS4: "",
+		Remote:         "",
+		Port:           "",
+		Proto:          ProtoTCP,
+		Username:       "",
+		Password:       "",
+		CAPath:         "",
+		CertPath:       "",
+		KeyPath:        "",
+		TLSAuthPath:    "",
+		TLSCryptPath:   "",
+		TLSCryptV2Path: "",
+		CA:             []byte{},
+		Cert:           []byte{},
+		Key:            []byte{},
+		TLSAuth:        []byte{},
+		TLSCrypt:       []byte{},
+		TLSCryptV2:     []byte{},
+		Cipher:         "",
+		Auth:           "",
+		TLSMaxVer:      "",
+		Compress:       CompressionEmpty,
+		ProxyOBFS4:     "",
 	}
 
 	// tag and inlineBuf are used to parse inline files.
@@ -471,7 +506,7 @@ func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 
 func isOpeningTag(key string) bool {
 	switch key {
-	case "<ca>", "<cert>", "<key>":
+	case "<ca>", "<cert>", "<key>", "<tls-auth>", "<tls-crypt>":
 		return true
 	default:
 		return false
@@ -480,7 +515,7 @@ func isOpeningTag(key string) bool {
 
 func isClosingTag(key string) bool {
 	switch key {
-	case "</ca>", "</cert>", "</key>":
+	case "</ca>", "</cert>", "</key>", "</tls-auth>", "</tls-crypt>":
 		return true
 	default:
 		return false
@@ -495,6 +530,10 @@ func parseTag(tag string) string {
 		return "cert"
 	case "<key>", "</key>":
 		return "key"
+	case "<tls-auth>", "</tls-auth>":
+		return "tls-auth"
+	case "<tls-crypt>", "</tls-crypt>":
+		return "tls-crypt"
 	default:
 		return ""
 	}
@@ -513,6 +552,12 @@ func parseInlineTag(o *OpenVPNOptions, tag string, buf *bytes.Buffer) error {
 		o.Cert = b
 	case "key":
 		o.Key = b
+	case "tls-auth":
+		o.TLSAuth = b
+	case "tls-crypt":
+		o.TLSCrypt = b
+	case "tls-crypt-v2":
+		o.TLSCryptV2 = b
 	default:
 		return fmt.Errorf("%w: unknown tag: %s", ErrBadConfig, tag)
 	}
