@@ -401,7 +401,7 @@ func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (
 		if updatedOpt, e := fn(p, opt); e != nil {
 			return updatedOpt, e
 		}
-	case "ca", "cert", "key", "tls-auth", "tls-crypt", "auth-user-pass":
+	case "ca", "cert", "key", "tls-auth", "tls-crypt", "tls-crypt-v2", "auth-user-pass":
 		fn := pMapDir[key].(func([]string, *OpenVPNOptions, string) (*OpenVPNOptions, error))
 		if updatedOpt, e := fn(p, opt, dir); e != nil {
 			return updatedOpt, e
@@ -443,9 +443,9 @@ func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 
 	// tag and inlineBuf are used to parse inline files.
 	// these follow the format used by the reference openvpn implementation.
-	// each block (any of ca, key, cert) is marked by a <option> line, and
-	// closed by a </option> line; lines in between are expected to contain
-	// the crypto block.
+	// each block (e.g., ca, key, cert, tls-auth, tls-crypt) is marked by a
+	// <option> line and closed by a </option> line; lines in between are
+	// expected to contain the crypto block.
 	tag := ""
 	inlineBuf := new(bytes.Buffer)
 
@@ -506,7 +506,7 @@ func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 
 func isOpeningTag(key string) bool {
 	switch key {
-	case "<ca>", "<cert>", "<key>", "<tls-auth>", "<tls-crypt>":
+	case "<ca>", "<cert>", "<key>", "<tls-auth>", "<tls-crypt>", "<tls-crypt-v2>":
 		return true
 	default:
 		return false
@@ -515,7 +515,7 @@ func isOpeningTag(key string) bool {
 
 func isClosingTag(key string) bool {
 	switch key {
-	case "</ca>", "</cert>", "</key>", "</tls-auth>", "</tls-crypt>":
+	case "</ca>", "</cert>", "</key>", "</tls-auth>", "</tls-crypt>", "</tls-crypt-v2>":
 		return true
 	default:
 		return false
@@ -534,6 +534,8 @@ func parseTag(tag string) string {
 		return "tls-auth"
 	case "<tls-crypt>", "</tls-crypt>":
 		return "tls-crypt"
+	case "<tls-crypt-v2>", "</tls-crypt-v2>":
+		return "tls-crypt-v2"
 	default:
 		return ""
 	}
