@@ -5,7 +5,6 @@ package datachannel
 //
 
 import (
-	"encoding/hex"
 	"fmt"
 	"sync"
 
@@ -154,9 +153,8 @@ func (ws *workersState) moveUpWorker() {
 			}
 
 			if len(decrypted) == 16 {
-				// TODO: should reply to this keepalive ping
-				// "2a 18 7b f3 64 1e b4 cb  07 ed 2d 0a 98 1f c7 48"
-				fmt.Println(hex.Dump(decrypted))
+				// Some OpenVPN servers send a 16-byte keepalive payload; it's not an IP packet.
+				ws.logger.Debugf("datachannel: keepalive payload received (%x)", decrypted)
 				continue
 			}
 

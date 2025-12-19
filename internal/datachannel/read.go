@@ -41,7 +41,9 @@ func decodeEncryptedPayloadAEAD(log model.Logger, buf []byte, session *session.M
 
 	headers := &bytes.Buffer{}
 	headers.WriteByte(opcodeAndKeyHeader(session))
-	bytesx.WriteUint24(headers, uint32(session.TunnelInfo().PeerID))
+	if dataOpcode(session) == model.P_DATA_V2 {
+		bytesx.WriteUint24(headers, uint32(session.TunnelInfo().PeerID))
+	}
 	headers.Write(packet_id)
 
 	// we need to swap because decryption expects payload|tag

@@ -52,6 +52,7 @@ func NewDataChannelFromOptions(logger model.Logger,
 		options:        opt,
 		sessionManager: sessionManager,
 		state:          state,
+		log:            logger,
 	}
 
 	dataCipher, err := newDataCipherFromCipherSuite(opt.Cipher)
@@ -131,6 +132,10 @@ func (d *DataChannel) setupKeys(dck *session.DataChannelKey) error {
 	d.state.hmacRemote = hmac.New(d.state.hash, hmacRemote[:hashSize])
 
 	log.Info("Key derivation OK")
+	if d.log != nil && d.sessionManager != nil {
+		ti := d.sessionManager.TunnelInfo()
+		d.log.Infof("Data channel packet format: %s (peer-id=%d)", dataOpcode(d.sessionManager), ti.PeerID)
+	}
 	return nil
 }
 
@@ -165,10 +170,13 @@ func (d *DataChannel) writePacket(payload []byte) (*model.Packet, error) {
 	// TODO(ainghazal): increment counter for used bytes
 	// and trigger renegotiation if we're near the end of the key useful lifetime.
 
-	packet := model.NewPacket(model.P_DATA_V2, d.sessionManager.CurrentKeyID(), encrypted)
-	peerid := &bytes.Buffer{}
-	bytesx.WriteUint24(peerid, uint32(d.sessionManager.TunnelInfo().PeerID))
-	packet.PeerID = model.PeerID(peerid.Bytes())
+	opcode := dataOpcode(d.sessionManager)
+	packet := model.NewPacket(opcode, d.sessionManager.CurrentKeyID(), encrypted)
+	if opcode == model.P_DATA_V2 {
+		peerid := &bytes.Buffer{}
+		bytesx.WriteUint24(peerid, uint32(d.sessionManager.TunnelInfo().PeerID))
+		packet.PeerID = model.PeerID(peerid.Bytes())
+	}
 	return packet, nil
 }
 

@@ -298,7 +298,7 @@ func (p *Packet) Bytes() ([]byte, error) {
 	buf := &bytes.Buffer{}
 
 	switch p.Opcode {
-	case P_DATA_V2:
+	case P_DATA_V1, P_DATA_V2:
 		// we assume this is an encrypted data packet,
 		// so we serialize just the encrypted payload
 

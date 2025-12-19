@@ -16,6 +16,18 @@ import (
 	"github.com/ooni/minivpn/pkg/config"
 )
 
+func dataOpcode(session *session.Manager) model.Opcode {
+	// We infer DATA_V1/DATA_V2 from the first data packet received from the server.
+	// When not inferred yet, default to DATA_V2 (legacy minivpn behaviour).
+	if session == nil {
+		return model.P_DATA_V2
+	}
+	if op := session.DataOpcode(); op != 0 {
+		return op
+	}
+	return model.P_DATA_V2
+}
+
 // encryptAndEncodePayloadAEAD peforms encryption and encoding of the payload in AEAD modes (i.e., AES-GCM).
 // TODO(ainghazal): for testing we can pass both the state object and the encryptFn
 func encryptAndEncodePayloadAEAD(log model.Logger, padded []byte, session *session.Manager, state *dataChannelState) ([]byte, error) {
@@ -26,11 +38,13 @@ func encryptAndEncodePayloadAEAD(log model.Logger, padded []byte, session *sessi
 
 	// in AEAD mode, we authenticate:
 	// - 1 byte: opcode/key
-	// - 3 bytes: peer-id (we're using P_DATA_V2)
+	// - 3 bytes: peer-id (only for P_DATA_V2)
 	// - 4 bytes: packet-id
 	aead := &bytes.Buffer{}
 	aead.WriteByte(opcodeAndKeyHeader(session))
-	bytesx.WriteUint24(aead, uint32(session.TunnelInfo().PeerID))
+	if dataOpcode(session) == model.P_DATA_V2 {
+		bytesx.WriteUint24(aead, uint32(session.TunnelInfo().PeerID))
+	}
 	bytesx.WriteUint32(aead, uint32(nextPacketID))
 
 	// the iv is the packetID (again) concatenated with the 8 bytes of the
@@ -97,7 +111,9 @@ func encryptAndEncodePayloadNonAEAD(log model.Logger, padded []byte, session *se
 
 	out := &bytes.Buffer{}
 	out.WriteByte(opcodeAndKeyHeader(session))
-	bytesx.WriteUint24(out, uint32(session.TunnelInfo().PeerID))
+	if dataOpcode(session) == model.P_DATA_V2 {
+		bytesx.WriteUint24(out, uint32(session.TunnelInfo().PeerID))
+	}
 
 	out.Write(computedMAC)
 	out.Write(iv)
@@ -167,5 +183,5 @@ func prependPacketID(p model.PacketID, buf []byte) []byte {
 // opcodeAndKeyHeader returns the header byte encoding the opcode and keyID (3 upper
 // and 5 lower bits, respectively)
 func opcodeAndKeyHeader(session *session.Manager) byte {
-	return byte((byte(model.P_DATA_V2) << 3) | (byte(session.CurrentKeyID()) & 0x07))
+	return byte((byte(dataOpcode(session)) << 3) | (byte(session.CurrentKeyID()) & 0x07))
 }

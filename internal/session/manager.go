@@ -33,6 +33,7 @@ type Manager struct {
 	logger               model.Logger
 	mu                   sync.Mutex
 	negState             model.NegotiationState
+	dataOpcode           model.Opcode
 	remoteSessionID      optional.Value[model.SessionID]
 	tunnelInfo           model.TunnelInfo
 	tracer               model.HandshakeTracer
@@ -57,6 +58,7 @@ func NewManager(config *config.Config) (*Manager, error) {
 		logger:               config.Logger(),
 		mu:                   sync.Mutex{},
 		negState:             0,
+		dataOpcode:           0,
 		remoteSessionID:      optional.None[model.SessionID](),
 		tunnelInfo:           model.TunnelInfo{},
 		tracer:               config.Tracer(),
@@ -253,6 +255,40 @@ func (m *Manager) CurrentKeyID() uint8 {
 	defer m.mu.Unlock()
 	m.mu.Lock()
 	return m.keyID
+}
+
+// DataOpcode returns the last seen data packet opcode (P_DATA_V1 or P_DATA_V2).
+// The zero value means we haven't inferred it yet.
+func (m *Manager) DataOpcode() model.Opcode {
+	defer m.mu.Unlock()
+	m.mu.Lock()
+	return m.dataOpcode
+}
+
+// MaybeSetDataOpcode sets the data packet opcode if it's still unknown.
+func (m *Manager) MaybeSetDataOpcode(op model.Opcode) {
+	if !op.IsData() {
+		return
+	}
+	defer m.mu.Unlock()
+	m.mu.Lock()
+	if m.dataOpcode != 0 {
+		return
+	}
+	m.dataOpcode = op
+}
+
+// MaybeSetPeerID sets the tunnel peer-id if we don't have one yet.
+func (m *Manager) MaybeSetPeerID(peerID int) {
+	if peerID == 0 {
+		return
+	}
+	defer m.mu.Unlock()
+	m.mu.Lock()
+	if m.tunnelInfo.PeerID != 0 {
+		return
+	}
+	m.tunnelInfo.PeerID = peerID
 }
 
 // InitTunnelInfo initializes TunnelInfo from data obtained from the auth response.

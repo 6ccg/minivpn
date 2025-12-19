@@ -114,6 +114,12 @@ type workersState struct {
 
 	// workersManager controls the workers lifecycle.
 	workersManager *workers.Manager
+
+	// loggedIncomingDataPacket indicates whether we've logged the first incoming data packet.
+	loggedIncomingDataPacket bool
+
+	// loggedOutgoingDataPacket indicates whether we've logged the first outgoing data packet.
+	loggedOutgoingDataPacket bool
 }
 
 // moveUpWorker moves packets up the stack
@@ -178,6 +184,21 @@ func (ws *workersState) moveDownWorker() {
 				continue
 			}
 
+			if packet.IsData() && !ws.loggedOutgoingDataPacket {
+				ws.loggedOutgoingDataPacket = true
+				if parsed, err := model.ParsePacket(rawPacket); err == nil {
+					ws.logger.Infof(
+						"packetmuxer: first outgoing data packet (opcode=%s key-id=%d peer-id=%x len=%d)",
+						parsed.Opcode,
+						parsed.KeyID,
+						parsed.PeerID,
+						len(rawPacket),
+					)
+				} else {
+					ws.logger.Infof("packetmuxer: first outgoing data packet (unparsed len=%d err=%s)", len(rawPacket), err.Error())
+				}
+			}
+
 			// POSSIBLY BLOCK on writing the packet to the networkio layer.
 			// [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
 
@@ -223,6 +244,14 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 		return nil // keep running
 	}
 
+	if packet.IsData() {
+		ws.sessionManager.MaybeSetDataOpcode(packet.Opcode)
+		if packet.Opcode == model.P_DATA_V2 {
+			peerID := int(packet.PeerID[0])<<16 | int(packet.PeerID[1])<<8 | int(packet.PeerID[2])
+			ws.sessionManager.MaybeSetPeerID(peerID)
+		}
+	}
+
 	// handle the case where we're performing a HARD_RESET
 	if ws.sessionManager.NegotiationState() == model.S_PRE_START &&
 		packet.Opcode == model.P_CONTROL_HARD_RESET_SERVER_V2 {
@@ -239,6 +268,16 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 			return workers.ErrShutdown
 		}
 	} else {
+		if packet.IsData() && !ws.loggedIncomingDataPacket && ws.sessionManager.NegotiationState() >= model.S_GENERATED_KEYS {
+			ws.loggedIncomingDataPacket = true
+			ws.logger.Infof(
+				"packetmuxer: first incoming data packet (opcode=%s key-id=%d peer-id=%x len=%d)",
+				packet.Opcode,
+				packet.KeyID,
+				packet.PeerID,
+				len(rawPacket),
+			)
+		}
 		if ws.sessionManager.NegotiationState() < model.S_GENERATED_KEYS {
 			// A well-behaved server should not send us data packets
 			// before we have a working session. Under normal operations, the
@@ -248,7 +287,13 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 			// is that we get injected packets intended to mess with the handshake.
 			// In this case, the caller will drop and log/trace the event.
 			if packet.IsData() {
-				ws.logger.Warnf("packetmuxer: moveUpWorker: cannot handle data yet")
+				ws.logger.Warnf(
+					"packetmuxer: moveUpWorker: cannot handle data yet (opcode=%s key-id=%d peer-id=%x len=%d)",
+					packet.Opcode,
+					packet.KeyID,
+					packet.PeerID,
+					len(rawPacket),
+				)
 				return errors.New("not ready to handle data")
 			}
 			ws.logger.Warnf("malformed input")
