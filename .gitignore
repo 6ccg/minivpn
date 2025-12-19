@@ -1,4 +1,7 @@
 /minivpn
+.gocache/
+*.tmp
+codex_test.tmp
 .vscode
 *.swp
 *.swo

@@ -287,14 +287,14 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 			// is that we get injected packets intended to mess with the handshake.
 			// In this case, the caller will drop and log/trace the event.
 			if packet.IsData() {
-				ws.logger.Warnf(
-					"packetmuxer: moveUpWorker: cannot handle data yet (opcode=%s key-id=%d peer-id=%x len=%d)",
+				ws.logger.Debugf(
+					"packetmuxer: moveUpWorker: drop early data packet (opcode=%s key-id=%d peer-id=%x len=%d)",
 					packet.Opcode,
 					packet.KeyID,
 					packet.PeerID,
 					len(rawPacket),
 				)
-				return errors.New("not ready to handle data")
+				return nil
 			}
 			ws.logger.Warnf("malformed input")
 			return errors.New("malformed input")
