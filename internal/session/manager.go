@@ -305,7 +305,9 @@ func (m *Manager) UpdateTunnelInfo(ti *model.TunnelInfo) {
 
 	m.tunnelInfo.IP = ti.IP
 	m.tunnelInfo.GW = ti.GW
-	m.tunnelInfo.PeerID = ti.PeerID
+	if ti.PeerID != 0 {
+		m.tunnelInfo.PeerID = ti.PeerID
+	}
 	m.tunnelInfo.NetMask = ti.NetMask
 
 	m.logger.Infof("Tunnel IP: %s", ti.IP)
