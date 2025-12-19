@@ -170,6 +170,16 @@ func customVerifyFactory(pinner authorityPinner) verifyFun {
 		opts := certVerifyOptions()
 		// Set the configured CA(s) as the certificate pool to verify against.
 		opts.Roots = pinner.authority()
+		if len(rawCerts) > 1 {
+			opts.Intermediates = x509.NewCertPool()
+			for _, certDER := range rawCerts[1:] {
+				cert, err := x509.ParseCertificate(certDER)
+				if err != nil {
+					return fmt.Errorf("%w: %s", ErrCannotVerifyCertChain, err)
+				}
+				opts.Intermediates.AddCert(cert)
+			}
+		}
 
 		if _, err := leaf.Verify(opts); err != nil {
 			return fmt.Errorf("%w: %s", ErrCannotVerifyCertChain, err)
