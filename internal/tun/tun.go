@@ -245,5 +245,17 @@ func (t *tunBioAddr) String() string {
 
 // NetMask returns the configured net mask for the TUN interface.
 func (t *TUN) NetMask() net.IPMask {
-	return net.IPMask(net.ParseIP(t.session.TunnelInfo().NetMask))
+	ip := net.ParseIP(t.session.TunnelInfo().NetMask)
+	if ip == nil {
+		return nil
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return net.IPMask(ip4)
+	}
+	return net.IPMask(ip)
+}
+
+// MTU returns the configured MTU for the TUN interface, if provided by the server.
+func (t *TUN) MTU() int {
+	return t.session.TunnelInfo().MTU
 }
