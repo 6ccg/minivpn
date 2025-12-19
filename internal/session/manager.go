@@ -287,6 +287,13 @@ func newTunnelInfoFromRemoteOptionsString(remoteOpts string) (*model.TunnelInfo,
 			}
 			t.MTU = mtu
 		}
+		if k == "peer-id" {
+			peer, err := strconv.Atoi(v[0])
+			if err != nil {
+				return nil, err
+			}
+			t.PeerID = peer
+		}
 	}
 	return t, nil
 }
