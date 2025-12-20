@@ -33,6 +33,15 @@ func (ws *workersState) moveUpWorker() {
 		case packet := <-ws.muxerToReliable:
 			ws.tracer.OnIncomingPacket(packet, ws.sessionManager.NegotiationState())
 
+			ws.logger.Debugf(
+				"reliabletransport: in opcode=%s id=%d replay=%d ts=%d acks=%v payload=%d",
+				packet.Opcode,
+				packet.ID,
+				packet.ReplayPacketID,
+				packet.Timestamp,
+				packet.ACKs,
+				len(packet.Payload),
+			)
 			if packet.Opcode != model.P_CONTROL_HARD_RESET_SERVER_V2 {
 				// the hard reset has already been logged by the layer below
 				packet.Log(ws.logger, model.DirectionIncoming)
@@ -70,6 +79,9 @@ func (ws *workersState) moveUpWorker() {
 			}
 
 			ready := receiver.NextIncomingSequence()
+			if len(ready) > 0 {
+				ws.logger.Debugf("reliabletransport: ready packets=%d first=%d last=%d", len(ready), ready[0].ID, ready[len(ready)-1].ID)
+			}
 			for _, nextPacket := range ready {
 				// POSSIBLY BLOCK delivering to the upper layer
 				select {

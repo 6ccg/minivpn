@@ -38,7 +38,18 @@ func (ws *workersState) moveDownWorker() {
 		select {
 		case packet := <-ws.controlToReliable:
 			// try to insert and schedule for immediate wakeup
-			if inserted := sender.TryInsertOutgoingPacket(packet); inserted {
+			inserted := sender.TryInsertOutgoingPacket(packet)
+			ws.logger.Debugf(
+				"reliabletransport: enqueue opcode=%s id=%d replay=%d ts=%d payload=%d inserted=%t inflight=%d",
+				packet.Opcode,
+				packet.ID,
+				packet.ReplayPacketID,
+				packet.Timestamp,
+				len(packet.Payload),
+				inserted,
+				len(sender.inFlight),
+			)
+			if inserted {
 				ticker.Reset(time.Nanosecond)
 			}
 
@@ -75,12 +86,26 @@ func (ws *workersState) blockOnTryingToSend(sender *reliableSender, ticker *time
 
 	// if we have packets to send piggyback the ACKs
 	if len(scheduledNow) > 0 {
+		ws.logger.Debugf(
+			"reliabletransport: sending packets=%d pendingACKs=%d",
+			len(scheduledNow),
+			sender.pendingACKsToSend.Len(),
+		)
 		// we flush everything that is ready to be sent.
 		for _, p := range scheduledNow {
 			p.ScheduleForRetransmission(now)
 
 			// append any pending ACKs
 			p.packet.ACKs = sender.NextPacketIDsToACK()
+			ws.logger.Debugf(
+				"reliabletransport: sending opcode=%s id=%d replay=%d ts=%d acks=%v payload=%d",
+				p.packet.Opcode,
+				p.packet.ID,
+				p.packet.ReplayPacketID,
+				p.packet.Timestamp,
+				p.packet.ACKs,
+				len(p.packet.Payload),
+			)
 
 			// log and trace the packet
 			p.packet.Log(ws.logger, model.DirectionOutgoing)
@@ -110,6 +135,12 @@ func (ws *workersState) blockOnTryingToSend(sender *reliableSender, ticker *time
 		ws.logger.Warnf("moveDownWorker: tryToSend: cannot create ack: %v", err.Error())
 		return
 	}
+	ws.logger.Debugf(
+		"reliabletransport: sending ACK replay=%d ts=%d acks=%v",
+		ACK.ReplayPacketID,
+		ACK.Timestamp,
+		ACK.ACKs,
+	)
 	ACK.Log(ws.logger, model.DirectionOutgoing)
 	select {
 	case ws.dataOrControlToMuxer <- ACK:

@@ -116,6 +116,7 @@ func NewControlChannelSecurityTLSCrypt(encoded []byte) (*ControlChannelSecurity,
 // (fixed_header | hexadecimal key data | fixed_trailer)
 func extractStaticKeyData(encoded []byte) ([]byte, error) {
 	s := strings.ReplaceAll(string(encoded), "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
 	s = strings.ReplaceAll(s, " ", "")
 
 	s = strings.TrimPrefix(s, OVPN_STATIC_KEY_BEGIN)
@@ -155,6 +156,7 @@ func NewControlChannelSecurityTLSCryptV2(encoded []byte) (*ControlChannelSecurit
 // (fixed_header | base64 key data | fixed_trailer)
 func extractCryptV2KeyData(encoded []byte) ([]byte, error) {
 	s := strings.ReplaceAll(string(encoded), "\n", "")
+	s = strings.ReplaceAll(s, "\r", "")
 	s = strings.ReplaceAll(s, " ", "")
 
 	s = strings.TrimPrefix(s, OVPN_TLS_CRYPT_V2_KEY_BEGIN)

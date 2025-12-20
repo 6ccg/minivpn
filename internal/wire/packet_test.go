@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -69,6 +70,18 @@ Mfhomlad2YvPhcFdy6zyCMEEz2gJqTvMf5tRkc8EgAGOYERUIMD5fbbgNKRDqVbT
 fwhsH+sAH6DB43GaXCegqflLKRDvVdsBWQ==
 -----END OpenVPN tls-crypt-v2 client key-----
 `
+
+func Test_ParseTLSCryptKeysCRLF(t *testing.T) {
+	crlfStatic := strings.ReplaceAll(OVPN_STATIC_KEY_CRYPT, "\n", "\r\n")
+	if _, err := NewControlChannelSecurityTLSCrypt([]byte(crlfStatic)); err != nil {
+		t.Errorf("tls-crypt static key with CRLF should parse: %v", err)
+	}
+
+	crlfV2 := strings.ReplaceAll(OVPN_CRYPT_V2_CLIENT_KEY, "\n", "\r\n")
+	if _, err := NewControlChannelSecurityTLSCryptV2([]byte(crlfV2)); err != nil {
+		t.Errorf("tls-crypt-v2 key with CRLF should parse: %v", err)
+	}
+}
 
 // TODO these tests should be replicated across all auth-modes
 func Test_ParsePacket(t *testing.T) {

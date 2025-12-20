@@ -5,6 +5,7 @@ package controlchannel
 import (
 	"fmt"
 
+	"github.com/ooni/minivpn/internal/bytesx"
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/session"
 	"github.com/ooni/minivpn/internal/workers"
@@ -83,6 +84,17 @@ func (ws *workersState) moveUpWorker() {
 		// POSSIBLY BLOCK on reading the packet moving up the stack
 		select {
 		case packet := <-ws.reliableToControl:
+			ws.logger.Debugf(
+				"%s: up %s id=%d replay=%d ts=%d acks=%v payload=%d head=%s",
+				workerName,
+				packet.Opcode,
+				packet.ID,
+				packet.ReplayPacketID,
+				packet.Timestamp,
+				packet.ACKs,
+				len(packet.Payload),
+				bytesx.HexPrefix(packet.Payload, 32),
+			)
 			// route the packets depending on their opcode
 			switch packet.Opcode {
 
@@ -119,6 +131,12 @@ func (ws *workersState) moveUpWorker() {
 				// send the packet to the TLS layer
 				select {
 				case ws.tlsRecordFromControl <- packet.Payload:
+					ws.logger.Debugf(
+						"%s: delivered tls record len=%d head=%s",
+						workerName,
+						len(packet.Payload),
+						bytesx.HexPrefix(packet.Payload, 32),
+					)
 					// nothing
 
 				case <-ws.workersManager.ShouldShutdown():
@@ -146,12 +164,28 @@ func (ws *workersState) moveDownWorker() {
 		// POSSIBLY BLOCK on reading the TLS record moving down the stack
 		select {
 		case record := <-ws.tlsRecordToControl:
+			// Copy the TLS record because upstream may reuse the backing buffer.
+			recordCopy := append([]byte(nil), record...)
+			ws.logger.Debugf(
+				"%s: down tls record len=%d head=%s",
+				workerName,
+				len(recordCopy),
+				bytesx.HexPrefix(recordCopy, 32),
+			)
 			// transform the record into a control message
-			packet, err := ws.sessionManager.NewPacket(model.P_CONTROL_V1, record)
+			packet, err := ws.sessionManager.NewPacket(model.P_CONTROL_V1, recordCopy)
 			if err != nil {
 				ws.logger.Warnf("%s: NewPacket: %s", workerName, err.Error())
 				return
 			}
+			ws.logger.Debugf(
+				"%s: created control packet id=%d replay=%d ts=%d payload=%d",
+				workerName,
+				packet.ID,
+				packet.ReplayPacketID,
+				packet.Timestamp,
+				len(packet.Payload),
+			)
 
 			// POSSIBLY BLOCK on sending the packet down the stack
 			select {

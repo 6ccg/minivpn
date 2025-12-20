@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -166,4 +167,15 @@ func WriteUint16(buf *bytes.Buffer, val uint32) {
 	b := &bytes.Buffer{}
 	WriteUint32(b, val)
 	buf.Write(b.Bytes()[2:])
+}
+
+// HexPrefix returns a hex-encoded prefix of b up to max bytes.
+func HexPrefix(b []byte, max int) string {
+	if max <= 0 || len(b) == 0 {
+		return ""
+	}
+	if len(b) > max {
+		b = b[:max]
+	}
+	return hex.EncodeToString(b)
 }

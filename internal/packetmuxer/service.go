@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/ooni/minivpn/internal/bytesx"
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/session"
 	"github.com/ooni/minivpn/internal/wire"
@@ -224,6 +225,13 @@ func (ws *workersState) startHardReset() error {
 
 	// emit a CONTROL_HARD_RESET_CLIENT_V2 pkt
 	packet := ws.sessionManager.NewHardResetPacket()
+	ws.logger.Debugf(
+		"packetmuxer: startHardReset count=%d opcode=%s replay=%d ts=%d",
+		ws.hardResetCount,
+		packet.Opcode,
+		packet.ReplayPacketID,
+		packet.Timestamp,
+	)
 	if err := ws.serializeAndEmit(packet); err != nil {
 		return err
 	}
@@ -236,12 +244,34 @@ func (ws *workersState) startHardReset() error {
 
 // handleRawPacket is the code invoked to handle a raw packet.
 func (ws *workersState) handleRawPacket(rawPacket []byte) error {
+	ws.logger.Debugf(
+		"packetmuxer: raw in len=%d head=%s",
+		len(rawPacket),
+		bytesx.HexPrefix(rawPacket, 32),
+	)
 	// make sense of the packet
 	packet, err := wire.UnmarshalPacket(rawPacket, ws.sessionManager.PacketAuth())
 	if err != nil {
-		ws.logger.Warnf("packetmuxer: moveUpWorker: ParsePacket: %s", err.Error())
+		ws.logger.Warnf(
+			"packetmuxer: moveUpWorker: ParsePacket: %s rawlen=%d head=%s",
+			err.Error(),
+			len(rawPacket),
+			bytesx.HexPrefix(rawPacket, 32),
+		)
 		return nil // keep running
 	}
+	ws.logger.Debugf(
+		"packetmuxer: parsed opcode=%s key=%d peer=%x id=%d replay=%d ts=%d acks=%v payload=%d head=%s",
+		packet.Opcode,
+		packet.KeyID,
+		packet.PeerID,
+		packet.ID,
+		packet.ReplayPacketID,
+		packet.Timestamp,
+		packet.ACKs,
+		len(packet.Payload),
+		bytesx.HexPrefix(packet.Payload, 32),
+	)
 
 	if packet.IsData() {
 		ws.sessionManager.MaybeSetDataOpcode(packet.Opcode)

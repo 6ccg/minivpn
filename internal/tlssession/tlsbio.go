@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ooni/minivpn/internal/bytesx"
 	"github.com/ooni/minivpn/internal/model"
 )
 
@@ -42,11 +43,12 @@ func (t *tlsBio) Read(data []byte) (int, error) {
 	for {
 		count, _ := t.readBuffer.Read(data)
 		if count > 0 {
-			t.logger.Debugf("[tlsbio] received %d bytes", len(data))
+			t.logger.Debugf("[tlsbio] read %d bytes head=%s", count, bytesx.HexPrefix(data[:count], 32))
 			return count, nil
 		}
 		select {
 		case extra := <-t.directionUp:
+			t.logger.Debugf("[tlsbio] buffer incoming %d bytes head=%s", len(extra), bytesx.HexPrefix(extra, 32))
 			t.readBuffer.Write(extra)
 		case <-t.hangup:
 			return 0, net.ErrClosed
@@ -55,7 +57,7 @@ func (t *tlsBio) Read(data []byte) (int, error) {
 }
 
 func (t *tlsBio) Write(data []byte) (int, error) {
-	t.logger.Debugf("[tlsbio] requested to write %d bytes", len(data))
+	t.logger.Debugf("[tlsbio] write %d bytes head=%s", len(data), bytesx.HexPrefix(data, 32))
 	select {
 	case t.directionDown <- data:
 		return len(data), nil

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/ooni/minivpn/internal/bytesx"
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/session"
 	"github.com/ooni/minivpn/internal/workers"
@@ -152,6 +153,7 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 		errorch <- err
 		return
 	}
+	ws.logger.Debug("tlssession: TLS handshake completed")
 	// In case you're wondering why we don't need to close the conn:
 	// we don't care since the underlying conn is a tlsBio
 	// defer tlsConn.Close()
@@ -220,6 +222,11 @@ func (ws *workersState) sendAuthRequestMessage(tlsConn net.Conn, activeKey *sess
 	if err != nil {
 		return err
 	}
+	ws.logger.Debugf(
+		"tlssession: send auth request len=%d head=%s",
+		len(ctrlMsg),
+		bytesx.HexPrefix(ctrlMsg, 32),
+	)
 
 	// let's fire off the message
 	_, err = tlsConn.Write(ctrlMsg)
@@ -235,6 +242,11 @@ func (ws *workersState) recvAuthReplyMessage(conn net.Conn) (*session.KeySource,
 		return nil, "", err
 	}
 	data := buffer[:count]
+	ws.logger.Debugf(
+		"tlssession: auth reply len=%d head=%s",
+		len(data),
+		bytesx.HexPrefix(data, 32),
+	)
 
 	// parse what we received
 	return parseServerControlMessage(data)
@@ -243,6 +255,11 @@ func (ws *workersState) recvAuthReplyMessage(conn net.Conn) (*session.KeySource,
 // sendPushRequestMessage sends the push request message
 func (ws *workersState) sendPushRequestMessage(conn net.Conn) error {
 	data := append([]byte("PUSH_REQUEST"), 0x00)
+	ws.logger.Debugf(
+		"tlssession: send push request len=%d head=%s",
+		len(data),
+		bytesx.HexPrefix(data, 32),
+	)
 	_, err := conn.Write(data)
 	return err
 }
@@ -256,6 +273,11 @@ func (ws *workersState) recvPushResponseMessage(conn net.Conn) (*model.TunnelInf
 		return nil, err
 	}
 	data := buffer[:count]
+	ws.logger.Debugf(
+		"tlssession: push reply len=%d head=%s",
+		len(data),
+		bytesx.HexPrefix(data, 32),
+	)
 
 	// parse what we received
 	return parseServerPushReply(ws.logger, data)
