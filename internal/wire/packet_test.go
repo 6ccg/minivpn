@@ -154,6 +154,40 @@ func Test_ParsePacket(t *testing.T) {
 }
 
 func Test_Packet_Bytes(t *testing.T) {
+	t.Run("serialize data v1 passthrough", func(t *testing.T) {
+		payload := []byte{byte(model.P_DATA_V1<<3 | 0x01), 0xaa, 0xbb, 0xcc}
+		p := &model.Packet{
+			Opcode:  model.P_DATA_V1,
+			KeyID:   1,
+			Payload: payload,
+		}
+		pa := &ControlChannelSecurity{Mode: ControlSecurityModeNone}
+		got, err := MarshalPacket(p, pa)
+		if err != nil {
+			t.Error("should not fail")
+		}
+		if diff := cmp.Diff(got, payload); diff != "" {
+			t.Errorf(diff)
+		}
+	})
+
+	t.Run("serialize data v2 passthrough", func(t *testing.T) {
+		payload := []byte{byte(model.P_DATA_V2<<3 | 0x00), 0x01, 0x02, 0x03, 0xdd, 0xee}
+		p := &model.Packet{
+			Opcode:  model.P_DATA_V2,
+			KeyID:   0,
+			Payload: payload,
+		}
+		pa := &ControlChannelSecurity{Mode: ControlSecurityModeNone}
+		got, err := MarshalPacket(p, pa)
+		if err != nil {
+			t.Error("should not fail")
+		}
+		if diff := cmp.Diff(got, payload); diff != "" {
+			t.Errorf(diff)
+		}
+	})
+
 	t.Run("serialize a bare mininum packet", func(t *testing.T) {
 		p := &model.Packet{Opcode: model.P_ACK_V1}
 		pa := &ControlChannelSecurity{Mode: ControlSecurityModeNone}
