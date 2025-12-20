@@ -54,13 +54,8 @@ func (s *Service) StartWorkers(
 	workersManager *workers.Manager,
 	sessionManager *session.Manager,
 ) {
-	dc, err := NewDataChannelFromOptions(config.Logger(), config.OpenVPNOptions(), sessionManager)
-	if err != nil {
-		config.Logger().Warnf("cannot initialize channel %v", err)
-		return
-	}
 	ws := &workersState{
-		dataChannel:          dc,
+		options:              config.OpenVPNOptions(),
 		dataOrControlToMuxer: *s.DataOrControlToMuxer,
 		dataToTUN:            s.DataToTUN,
 		keyReady:             s.KeyReady,
@@ -73,7 +68,7 @@ func (s *Service) StartWorkers(
 
 	firstKeyReady := make(chan any)
 
-	workersManager.StartWorker(ws.moveUpWorker)
+	workersManager.StartWorker(func() { ws.moveUpWorker(firstKeyReady) })
 	workersManager.StartWorker(func() { ws.moveDownWorker(firstKeyReady) })
 	workersManager.StartWorker(func() { ws.keyWorker(firstKeyReady) })
 }
@@ -81,6 +76,7 @@ func (s *Service) StartWorkers(
 // workersState contains the data channel state.
 type workersState struct {
 	dataChannel          *DataChannel
+	options              *config.OpenVPNOptions
 	dataOrControlToMuxer chan<- *model.Packet
 	dataToTUN            chan<- []byte
 	keyReady             <-chan *session.DataChannelKey
@@ -130,7 +126,7 @@ func (ws *workersState) moveDownWorker(firstKeyReady <-chan any) {
 }
 
 // moveUpWorker moves packets up the stack
-func (ws *workersState) moveUpWorker() {
+func (ws *workersState) moveUpWorker(firstKeyReady <-chan any) {
 	workerName := fmt.Sprintf("%s: moveUpWorker", serviceName)
 
 	defer func() {
@@ -140,29 +136,35 @@ func (ws *workersState) moveUpWorker() {
 	}()
 	ws.logger.Debugf("%s: started", workerName)
 
-	for {
-		select {
-		// TODO: opportunistically try to kill lame duck
+	select {
+	// wait for the first key to be ready
+	case <-firstKeyReady:
+		for {
+			select {
+			// TODO: opportunistically try to kill lame duck
 
-		case pkt := <-ws.muxerToData:
-			// TODO(ainghazal): factor out as handler function
-			decrypted, err := ws.dataChannel.readPacket(pkt)
-			if err != nil {
-				ws.logger.Warnf("error decrypting: %v", err)
-				continue
+			case pkt := <-ws.muxerToData:
+				// TODO(ainghazal): factor out as handler function
+				decrypted, err := ws.dataChannel.readPacket(pkt)
+				if err != nil {
+					ws.logger.Warnf("error decrypting: %v", err)
+					continue
+				}
+
+				if len(decrypted) == 16 {
+					// Some OpenVPN servers send a 16-byte keepalive payload; it's not an IP packet.
+					ws.logger.Debugf("datachannel: keepalive payload received (%x)", decrypted)
+					continue
+				}
+
+				// POSSIBLY BLOCK writing up towards TUN
+				ws.dataToTUN <- decrypted
+			case <-ws.workersManager.ShouldShutdown():
+				return
 			}
-
-			if len(decrypted) == 16 {
-				// Some OpenVPN servers send a 16-byte keepalive payload; it's not an IP packet.
-				ws.logger.Debugf("datachannel: keepalive payload received (%x)", decrypted)
-				continue
-			}
-
-			// POSSIBLY BLOCK writing up towards TUN
-			ws.dataToTUN <- decrypted
-		case <-ws.workersManager.ShouldShutdown():
-			return
 		}
+	case <-ws.workersManager.ShouldShutdown():
+		return
 	}
 }
 
@@ -184,6 +186,19 @@ func (ws *workersState) keyWorker(firstKeyReady chan<- any) {
 			// TODO(ainghazal): thread safety here - need to lock.
 			// When we actually get to key rotation, we need to add locks.
 			// Use RW lock, reader locks.
+
+			if ws.dataChannel == nil {
+				dc, err := NewDataChannelFromOptions(ws.logger, ws.options, ws.sessionManager)
+				if err != nil {
+					ws.logger.Warnf("cannot initialize channel %v", err)
+					select {
+					case ws.sessionManager.Failure <- err:
+					default:
+					}
+					return
+				}
+				ws.dataChannel = dc
+			}
 
 			err := ws.dataChannel.setupKeys(key)
 			if err != nil {

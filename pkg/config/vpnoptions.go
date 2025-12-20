@@ -135,7 +135,7 @@ func (o *OpenVPNOptions) HasAuthInfo() bool {
 }
 
 // clientOptions is the options line we're passing to the OpenVPN server during the handshake.
-const clientOptions = "V4,dev-type tun,link-mtu 1549,tun-mtu 1500,proto %sv4,cipher %s,auth %s,keysize %s,key-method 2,tls-client"
+const clientOptions = "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto %sv4,cipher %s,auth %s,keysize %s,key-method 2,tls-client"
 
 // ServerOptionsString produces a comma-separated representation of the options, in the same
 // order and format that the OpenVPN server expects from us.

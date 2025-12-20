@@ -49,9 +49,8 @@ func encodeClientControlMessageAsBytes(k *session.KeySource, o *config.OpenVPNOp
 	out.Write(user)
 	out.Write(pass)
 
-	// we could send IV_PLAT too, but afaik declaring the platform does not
-	// make any difference for our purposes.
-	rawInfo := fmt.Sprintf("IV_VER=%s\nIV_PROTO=%s\n", ivVer, ivProto)
+	// Peer info fields needed for server compatibility, especially NCP negotiation
+	rawInfo := fmt.Sprintf("IV_VER=%s\nIV_PROTO=%s\nIV_NCP=2\nIV_CIPHERS=AES-256-GCM:AES-128-GCM:AES-256-CBC\nIV_PLAT=win\n", ivVer, ivProto)
 	peerInfo, _ := bytesx.EncodeOptionStringToBytes(rawInfo)
 	out.Write(peerInfo)
 	return out.Bytes(), nil
@@ -61,7 +60,7 @@ func encodeClientControlMessageAsBytes(k *session.KeySource, o *config.OpenVPNOp
 var controlMessageHeader = []byte{0x00, 0x00, 0x00, 0x00}
 
 const ivVer = "2.5.5" // OpenVPN version compat that we declare to the server
-const ivProto = "2"   // IV_PROTO declared to the server. We need to be sure to enable the peer-id bit to use P_DATA_V2.
+const ivProto = "8094"  // IV_PROTO: 2(TLS_KEY_EXPORT) + 4(REQUEST_PUSH) + 8(NCP_P2P) + 16(DNS_OPTION)
 
 // errMissingHeader indicates that we're missing the four-byte all-zero header.
 var errMissingHeader = errors.New("missing four-byte all-zero header")

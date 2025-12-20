@@ -91,19 +91,37 @@ func WriteTestingCerts(dir string) (TestingCert, error) {
 	if err != nil {
 		return TestingCert{}, err
 	}
-	certFile.Write(pemTestingCertificate)
+	if _, err := certFile.Write(pemTestingCertificate); err != nil {
+		_ = certFile.Close()
+		return TestingCert{}, err
+	}
+	if err := certFile.Close(); err != nil {
+		return TestingCert{}, err
+	}
 
 	keyFile, err := os.CreateTemp(dir, "tmpfile-")
 	if err != nil {
 		return TestingCert{}, err
 	}
-	keyFile.Write(pemTestingKey)
+	if _, err := keyFile.Write(pemTestingKey); err != nil {
+		_ = keyFile.Close()
+		return TestingCert{}, err
+	}
+	if err := keyFile.Close(); err != nil {
+		return TestingCert{}, err
+	}
 
 	caFile, err := os.CreateTemp(dir, "tmpfile-")
 	if err != nil {
 		return TestingCert{}, err
 	}
-	caFile.Write(pemTestingCa)
+	if _, err := caFile.Write(pemTestingCa); err != nil {
+		_ = caFile.Close()
+		return TestingCert{}, err
+	}
+	if err := caFile.Close(); err != nil {
+		return TestingCert{}, err
+	}
 
 	testingCert := TestingCert{
 		Cert: certFile.Name(),

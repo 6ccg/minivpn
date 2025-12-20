@@ -4,6 +4,8 @@ package packetmuxer
 import (
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"time"
 
 	"github.com/ooni/minivpn/internal/bytesx"
@@ -13,6 +15,11 @@ import (
 	"github.com/ooni/minivpn/internal/workers"
 	"github.com/ooni/minivpn/pkg/config"
 )
+
+// debugWireEnabled checks if wire-level debug is enabled
+func debugWireEnabled() bool {
+	return os.Getenv("MINIVPN_DEBUG_WIRE") == "1" || os.Getenv("MINIVPN_DEBUG_ALL") == "1"
+}
 
 var serviceName = "packetmuxer"
 
@@ -244,6 +251,21 @@ func (ws *workersState) startHardReset() error {
 
 // handleRawPacket is the code invoked to handle a raw packet.
 func (ws *workersState) handleRawPacket(rawPacket []byte) error {
+	// Debug: full wire dump of incoming packet
+	if debugWireEnabled() {
+		log.Printf("[DEBUG-WIRE] <<< RECV raw (%d bytes): %x", len(rawPacket), rawPacket)
+		// Break down the packet for tls-auth
+		if ws.sessionManager.PacketAuth().Mode == wire.ControlSecurityModeTLSAuth && len(rawPacket) >= 38 {
+			log.Printf("[DEBUG-WIRE] <<< RECV breakdown (tls-auth):")
+			log.Printf("[DEBUG-WIRE]     opcode/key (1): %x", rawPacket[0:1])
+			log.Printf("[DEBUG-WIRE]     session_id (8): %x", rawPacket[1:9])
+			log.Printf("[DEBUG-WIRE]     hmac (20): %x", rawPacket[9:29])
+			log.Printf("[DEBUG-WIRE]     replay_id (4): %x", rawPacket[29:33])
+			log.Printf("[DEBUG-WIRE]     timestamp (4): %x", rawPacket[33:37])
+			log.Printf("[DEBUG-WIRE]     rest (%d): %x", len(rawPacket)-37, rawPacket[37:])
+		}
+	}
+
 	ws.logger.Debugf(
 		"packetmuxer: raw in len=%d head=%s",
 		len(rawPacket),
@@ -373,6 +395,21 @@ func (ws *workersState) serializeAndEmit(packet *model.Packet) error {
 	rawPacket, err := wire.MarshalPacket(packet, ws.sessionManager.PacketAuth())
 	if err != nil {
 		return err
+	}
+
+	// Debug: full wire dump of outgoing packet
+	if debugWireEnabled() {
+		log.Printf("[DEBUG-WIRE] >>> SEND raw (%d bytes): %x", len(rawPacket), rawPacket)
+		// Break down the packet for tls-auth
+		if ws.sessionManager.PacketAuth().Mode == wire.ControlSecurityModeTLSAuth && len(rawPacket) >= 38 {
+			log.Printf("[DEBUG-WIRE] >>> SEND breakdown (tls-auth):")
+			log.Printf("[DEBUG-WIRE]     opcode/key (1): %x", rawPacket[0:1])
+			log.Printf("[DEBUG-WIRE]     session_id (8): %x", rawPacket[1:9])
+			log.Printf("[DEBUG-WIRE]     hmac (20): %x", rawPacket[9:29])
+			log.Printf("[DEBUG-WIRE]     replay_id (4): %x", rawPacket[29:33])
+			log.Printf("[DEBUG-WIRE]     timestamp (4): %x", rawPacket[33:37])
+			log.Printf("[DEBUG-WIRE]     rest (%d): %x", len(rawPacket)-37, rawPacket[37:])
+		}
 	}
 
 	ws.tracer.OnOutgoingPacket(

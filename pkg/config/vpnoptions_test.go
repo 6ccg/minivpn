@@ -50,7 +50,7 @@ func TestOptions_String(t *testing.T) {
 				Auth:   "sha512",
 				Proto:  ProtoTCP,
 			},
-			want: "V4,dev-type tun,link-mtu 1549,tun-mtu 1500,proto TCPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client",
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto TCPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client",
 		},
 		{
 			name: "compress stub",
@@ -60,7 +60,7 @@ func TestOptions_String(t *testing.T) {
 				Proto:    ProtoUDP,
 				Compress: CompressionStub,
 			},
-			want: "V4,dev-type tun,link-mtu 1549,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,compress stub",
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,compress stub",
 		},
 		{
 			name: "compress lzo-no",
@@ -70,7 +70,7 @@ func TestOptions_String(t *testing.T) {
 				Proto:    ProtoUDP,
 				Compress: CompressionLZONo,
 			},
-			want: "V4,dev-type tun,link-mtu 1549,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,lzo-comp no",
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,lzo-comp no",
 		},
 	}
 	for _, tt := range tests {
@@ -274,7 +274,13 @@ func writeDummyConfigFile(dir string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	f.Write(dummyConfigFile)
+	if _, err := f.Write(dummyConfigFile); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
 	return f.Name(), nil
 }
 
@@ -553,6 +559,10 @@ func Test_parseAuthUser(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := f.Write([]byte(credStr)); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
 		return f.Name()
@@ -671,6 +681,10 @@ func Test_getCredentialsFromFile(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := f.Write([]byte(credStr)); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+		if err := f.Close(); err != nil {
 			t.Fatal(err)
 		}
 		return f.Name()

@@ -1,9 +1,12 @@
 package tlssession
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"net"
+	"strings"
+	"time"
 
 	"github.com/ooni/minivpn/internal/bytesx"
 	"github.com/ooni/minivpn/internal/model"
@@ -16,6 +19,10 @@ import (
 
 var (
 	serviceName = "tlssession"
+
+	// ErrNoPushReply is returned when the server does not send PUSH_REPLY within
+	// the expected time window.
+	ErrNoPushReply = errors.New("no reply from server to push requests")
 )
 
 // Service is the tlssession service. Make sure you initialize
@@ -90,16 +97,23 @@ func (ws *workersState) worker() {
 		case notif := <-ws.notifyTLS:
 			if (notif.Flags & model.NotificationReset) != 0 {
 				if err := ws.tlsAuth(); err != nil {
-
-					// TODO(ainghazal): pass the failure to the tracer too.
-
-					if errors.Is(err, ErrBadCA) {
-						ws.sessionManager.Failure <- err
+					if errors.Is(err, workers.ErrShutdown) {
 						return
 					}
-					// The following errors are not handled, will just appear
-					// as warnings in the log. We should catch any errors that we want to
-					// deal with as unrecoverable failures in the block above.
+
+					// If we don't have a working data channel yet, a TLS session
+					// failure is unrecoverable and we must fail fast, otherwise
+					// StartTUN will just time out with a generic context error.
+					if ws.sessionManager.NegotiationState() < model.S_GENERATED_KEYS {
+						select {
+						case ws.sessionManager.Failure <- err:
+						default:
+						}
+						return
+					}
+
+					// If we already have keys (e.g., during soft reset / key
+					// rotation), keep the existing session alive and just warn.
 					ws.logger.Warnf("%s: %s", workerName, err.Error())
 				}
 			}
@@ -190,15 +204,55 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 	activeKey.AddRemoteKey(remoteKey)
 	ws.sessionManager.SetNegotiationState(model.S_GOT_KEY)
 
-	// send the push request
+	// Send PUSH_REQUEST and keep retrying until we receive PUSH_REPLY.
+	// The reference OpenVPN client periodically resends PUSH_REQUEST, because
+	// some servers defer the push-reply until the connection is fully ready.
+	const (
+		pushRequestInterval = 5 * time.Second
+		pushReplyTimeout    = 55 * time.Second
+	)
+
 	if err := ws.sendPushRequestMessage(tlsConn); err != nil {
 		errorch <- err
 		return
 	}
 
-	// obtain tunnel info from the push response
+	stopPushRequests := make(chan struct{})
+	pushTimeout := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(pushRequestInterval)
+		defer ticker.Stop()
+
+		deadline := time.NewTimer(pushReplyTimeout)
+		defer deadline.Stop()
+
+		attempt := 1
+		for {
+			select {
+			case <-ticker.C:
+				attempt++
+				ws.logger.Debugf("tlssession: resend push request attempt=%d", attempt)
+				if err := ws.sendPushRequestMessage(tlsConn); err != nil {
+					ws.logger.Warnf("tlssession: resend push request: %v", err)
+				}
+			case <-deadline.C:
+				pushTimeout <- fmt.Errorf("%w after %s (%d requests)", ErrNoPushReply, pushReplyTimeout, attempt)
+				_ = tlsConn.Close()
+				return
+			case <-stopPushRequests:
+				return
+			}
+		}
+	}()
+
 	tinfo, err := ws.recvPushResponseMessage(tlsConn)
+	close(stopPushRequests)
 	if err != nil {
+		select {
+		case perr := <-pushTimeout:
+			err = perr
+		default:
+		}
 		errorch <- err
 		return
 	}
@@ -264,21 +318,90 @@ func (ws *workersState) sendPushRequestMessage(conn net.Conn) error {
 	return err
 }
 
-// recvPushResponseMessage receives and parses the push response message
-func (ws *workersState) recvPushResponseMessage(conn net.Conn) (*model.TunnelInfo, error) {
-	// read raw bytes
-	buffer := make([]byte, 1<<17)
-	count, err := conn.Read(buffer)
-	if err != nil {
-		return nil, err
-	}
-	data := buffer[:count]
-	ws.logger.Debugf(
-		"tlssession: push reply len=%d head=%s",
-		len(data),
-		bytesx.HexPrefix(data, 32),
-	)
+type controlMessageReader struct {
+	pending []byte
+}
 
-	// parse what we received
-	return parseServerPushReply(ws.logger, data)
+func (r *controlMessageReader) readNext(conn net.Conn, scratch []byte) ([]byte, error) {
+	for {
+		if idx := bytes.IndexByte(r.pending, 0x00); idx >= 0 {
+			msg := r.pending[:idx+1]
+			r.pending = r.pending[idx+1:]
+			return msg, nil
+		}
+		n, err := conn.Read(scratch)
+		if err != nil {
+			return nil, err
+		}
+		r.pending = append(r.pending, scratch[:n]...)
+	}
+}
+
+// recvPushResponseMessage receives and parses the push response message.
+func (ws *workersState) recvPushResponseMessage(conn net.Conn) (*model.TunnelInfo, error) {
+	reader := &controlMessageReader{}
+	scratch := make([]byte, 1<<12) // avoid large allocations while looping
+
+	for {
+		msg, err := reader.readNext(conn, scratch)
+		if err != nil {
+			return nil, err
+		}
+		if len(msg) == 0 {
+			continue
+		}
+
+		ws.logger.Debugf(
+			"tlssession: control msg len=%d head=%s",
+			len(msg),
+			bytesx.HexPrefix(msg, 32),
+		)
+
+		// We only need PUSH_REPLY; ignore other messages until we get it.
+		switch {
+		case bytes.HasPrefix(msg, serverBadAuth):
+			return nil, errBadAuth
+		case bytes.HasPrefix(msg, serverPushReply):
+			optsMap := pushedOptionsAsMap(msg)
+			ws.logger.Infof("Server pushed options: %v", optsMap)
+			ws.applyPushedCipher(optsMap)
+			return newTunnelInfoFromPushedOptions(optsMap), nil
+		case bytes.HasPrefix(msg, []byte("AUTH_PENDING")):
+			ws.logger.Debugf("tlssession: received AUTH_PENDING, waiting for PUSH_REPLY")
+		case bytes.HasPrefix(msg, []byte("INFO_PRE")):
+			ws.logger.Debugf("tlssession: received INFO_PRE, waiting for PUSH_REPLY")
+		default:
+			ws.logger.Debugf("tlssession: ignoring control msg, waiting for PUSH_REPLY")
+		}
+	}
+}
+
+func (ws *workersState) applyPushedCipher(opts remoteOptions) {
+	cipher := ""
+	if v, ok := opts["cipher"]; ok && len(v) >= 1 {
+		cipher = strings.TrimSpace(v[0])
+	}
+	if cipher == "" || ws.options == nil {
+		return
+	}
+
+	canonical, ok := canonicalSupportedCipher(cipher)
+	if !ok {
+		ws.logger.Warnf("Ignoring unsupported PUSH_REPLY cipher: %q", cipher)
+		return
+	}
+	if ws.options.Cipher == canonical {
+		return
+	}
+	ws.logger.Infof("Negotiated data cipher: %s (from PUSH_REPLY, was %s)", canonical, ws.options.Cipher)
+	ws.options.Cipher = canonical
+}
+
+func canonicalSupportedCipher(cipher string) (string, bool) {
+	for _, supported := range config.SupportedCiphers {
+		if strings.EqualFold(supported, cipher) {
+			return supported, true
+		}
+	}
+	return "", false
 }

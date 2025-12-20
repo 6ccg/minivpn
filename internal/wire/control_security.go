@@ -9,8 +9,15 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"log"
+	"os"
 	"strings"
 )
+
+// Debug helper: check if a debug env var is enabled
+func debugEnabled(envVar string) bool {
+	return os.Getenv(envVar) == "1" || os.Getenv("MINIVPN_DEBUG_ALL") == "1"
+}
 
 // The auth keys provided by the server are 64 bytes, but tls-auth
 // only uses the first 20
@@ -73,11 +80,31 @@ func NewControlChannelSecurityTLSAuth(encoded []byte, direction int) (*ControlCh
 		return nil, err
 	}
 
+	// Debug: show all 4 key chunks
+	if debugEnabled("MINIVPN_DEBUG_KEY") {
+		n := len(buf) / 4
+		log.Printf("[DEBUG-KEY] TLS-AUTH Static key total len: %d", len(buf))
+		log.Printf("[DEBUG-KEY] Key chunk 0 (0-%d):     %x", n, buf[0:n])
+		log.Printf("[DEBUG-KEY] Key chunk 1 (%d-%d):   %x", n, 2*n, buf[n:2*n])
+		log.Printf("[DEBUG-KEY] Key chunk 2 (%d-%d):  %x", 2*n, 3*n, buf[2*n:3*n])
+		log.Printf("[DEBUG-KEY] Key chunk 3 (%d-%d):  %x", 3*n, 4*n, buf[3*n:4*n])
+		log.Printf("[DEBUG-KEY] Direction: %d", direction)
+	}
+
 	// keyData can be divided into 4 equal sized "chunks" e.g. [..., a, ..., b]
 	// we only need the first 20 bytes of the chunk to form the key
 	n := len(buf) / 4
 	a := buf[n : n+CONTROL_CHANNEL_KEY_TOTAL_LENGTH]
 	b := buf[3*n : 3*n+CONTROL_CHANNEL_KEY_TOTAL_LENGTH]
+
+	// Debug: show which indices are being used
+	if debugEnabled("MINIVPN_DEBUG_KEY") {
+		log.Printf("[DEBUG-KEY] Current code uses: a=buf[%d:%d] (index 1), b=buf[%d:%d] (index 3)",
+			n, n+CONTROL_CHANNEL_KEY_TOTAL_LENGTH, 3*n, 3*n+CONTROL_CHANNEL_KEY_TOTAL_LENGTH)
+		log.Printf("[DEBUG-KEY] NOTE: OpenVPN tls-auth should use index 0 and 2, not 1 and 3!")
+		log.Printf("[DEBUG-KEY] Key 'a' (first 20 bytes): %x", a[:20])
+		log.Printf("[DEBUG-KEY] Key 'b' (first 20 bytes): %x", b[:20])
+	}
 
 	var localDigestKey, remoteDigestKey ControlChannelKey
 	switch direction {
@@ -87,6 +114,12 @@ func NewControlChannelSecurityTLSAuth(encoded []byte, direction int) (*ControlCh
 	case 1:
 		copy(localDigestKey[:], b)
 		copy(remoteDigestKey[:], a)
+	}
+
+	// Debug: show final key assignment
+	if debugEnabled("MINIVPN_DEBUG_KEY") {
+		log.Printf("[DEBUG-KEY] Final LocalDigestKey (first 20):  %x", localDigestKey[:20])
+		log.Printf("[DEBUG-KEY] Final RemoteDigestKey (first 20): %x", remoteDigestKey[:20])
 	}
 
 	return &ControlChannelSecurity{
@@ -166,6 +199,16 @@ func extractCryptV2KeyData(encoded []byte) ([]byte, error) {
 }
 
 func GenerateTLSAuthDigest(key *ControlChannelKey, header []byte, replay []byte, message []byte) SHA1HMACDigest {
+	// Debug: show HMAC inputs
+	if debugEnabled("MINIVPN_DEBUG_HMAC") {
+		log.Printf("[DEBUG-HMAC] GenerateTLSAuthDigest inputs:")
+		log.Printf("[DEBUG-HMAC]   key (first 20): %x", key[:TLS_AUTH_KEY_LENGTH])
+		log.Printf("[DEBUG-HMAC]   replay (%d bytes): %x", len(replay), replay)
+		log.Printf("[DEBUG-HMAC]   header (%d bytes): %x", len(header), header)
+		log.Printf("[DEBUG-HMAC]   message (%d bytes): %x", len(message), message)
+		log.Printf("[DEBUG-HMAC]   HMAC order: replay || header || message")
+	}
+
 	h := hmac.New(crypto.SHA1.New, key[:TLS_AUTH_KEY_LENGTH])
 
 	h.Write(replay)
@@ -173,6 +216,12 @@ func GenerateTLSAuthDigest(key *ControlChannelKey, header []byte, replay []byte,
 	h.Write(message)
 
 	sig := h.Sum(nil)
+
+	// Debug: show HMAC output
+	if debugEnabled("MINIVPN_DEBUG_HMAC") {
+		log.Printf("[DEBUG-HMAC]   output: %x", sig)
+	}
+
 	return SHA1HMACDigest(sig)
 }
 

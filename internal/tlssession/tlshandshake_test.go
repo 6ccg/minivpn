@@ -102,139 +102,114 @@ type testingCert struct {
 	ca   string
 }
 
+func writeTempFile(dir string, data []byte) (string, error) {
+	f, err := os.CreateTemp(dir, "tmpfile-")
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return f.Name(), nil
+}
+
 func writeTestingCerts(dir string) (testingCert, error) {
-	certFile, err := os.CreateTemp(dir, "tmpfile-")
+	cert, err := writeTempFile(dir, pemTestingCertificate)
 	if err != nil {
 		return testingCert{}, err
 	}
-	certFile.Write(pemTestingCertificate)
 
-	keyFile, err := os.CreateTemp(dir, "tmpfile-")
+	key, err := writeTempFile(dir, pemTestingKey)
 	if err != nil {
 		return testingCert{}, err
 	}
-	keyFile.Write(pemTestingKey)
 
-	caFile, err := os.CreateTemp(dir, "tmpfile-")
+	ca, err := writeTempFile(dir, pemTestingCa)
 	if err != nil {
 		return testingCert{}, err
 	}
-	caFile.Write(pemTestingCa)
 
-	testingCert := testingCert{
-		cert: certFile.Name(),
-		key:  keyFile.Name(),
-		ca:   caFile.Name(),
-	}
-	return testingCert, nil
+	return testingCert{cert: cert, key: key, ca: ca}, nil
 }
 
 func writeTestingCertsBadCAFile(dir string) (testingCert, error) {
-	certFile, err := os.CreateTemp(dir, "tmpfile-")
+	cert, err := writeTempFile(dir, pemTestingCertificate)
 	if err != nil {
 		return testingCert{}, err
 	}
-	certFile.Write(pemTestingCertificate)
 
-	keyFile, err := os.CreateTemp(dir, "tmpfile-")
+	key, err := writeTempFile(dir, pemTestingKey)
 	if err != nil {
 		return testingCert{}, err
 	}
-	keyFile.Write(pemTestingKey)
 
-	caFile, err := os.CreateTemp(dir, "tmpfile-")
+	ca, err := writeTempFile(dir, pemTestingCa[:len(pemTestingCa)-10])
 	if err != nil {
 		return testingCert{}, err
 	}
-	caFile.Write(pemTestingCa[:len(pemTestingCa)-10])
 
-	testingCert := testingCert{
-		cert: certFile.Name(),
-		key:  keyFile.Name(),
-		ca:   caFile.Name() + "-non-existent",
-	}
-	return testingCert, nil
+	return testingCert{cert: cert, key: key, ca: ca + "-non-existent"}, nil
 }
 
 func writeTestingCertsBadCA(dir string) (testingCert, error) {
-	certFile, err := os.CreateTemp(dir, "tmpfile-")
+	cert, err := writeTempFile(dir, pemTestingCertificate)
 	if err != nil {
 		return testingCert{}, err
 	}
-	certFile.Write(pemTestingCertificate)
 
-	keyFile, err := os.CreateTemp(dir, "tmpfile-")
+	key, err := writeTempFile(dir, pemTestingKey)
 	if err != nil {
 		return testingCert{}, err
 	}
-	keyFile.Write(pemTestingKey)
 
-	caFile, err := os.CreateTemp(dir, "tmpfile-")
+	ca, err := writeTempFile(dir, pemTestingCa[:len(pemTestingCa)-10])
 	if err != nil {
 		return testingCert{}, err
 	}
-	caFile.Write(pemTestingCa[:len(pemTestingCa)-10])
 
-	testingCert := testingCert{
-		cert: certFile.Name(),
-		key:  keyFile.Name(),
-		ca:   caFile.Name(),
-	}
-	return testingCert, nil
+	return testingCert{cert: cert, key: key, ca: ca}, nil
 }
 
 func writeTestingCertsBadKey(dir string) (testingCert, error) {
-	certFile, err := os.CreateTemp(dir, "tmpfile-")
+	cert, err := writeTempFile(dir, pemTestingCertificate)
 	if err != nil {
 		return testingCert{}, err
 	}
-	certFile.Write(pemTestingCertificate)
 
-	keyFile, err := os.CreateTemp(dir, "tmpfile-")
+	key, err := writeTempFile(dir, pemTestingKey[:len(pemTestingKey)-10])
 	if err != nil {
 		return testingCert{}, err
 	}
-	keyFile.Write(pemTestingKey[:len(pemTestingKey)-10])
 
-	caFile, err := os.CreateTemp(dir, "tmpfile-")
+	ca, err := writeTempFile(dir, pemTestingCa)
 	if err != nil {
 		return testingCert{}, err
 	}
-	caFile.Write(pemTestingCa)
 
-	testingCert := testingCert{
-		cert: certFile.Name(),
-		key:  keyFile.Name(),
-		ca:   caFile.Name(),
-	}
-	return testingCert, nil
+	return testingCert{cert: cert, key: key, ca: ca}, nil
 }
 
 func writeTestingCertsBadCert(dir string) (testingCert, error) {
-	certFile, err := os.CreateTemp(dir, "tmpfile-")
+	cert, err := writeTempFile(dir, pemTestingCertificate[:len(pemTestingCertificate)-10])
 	if err != nil {
 		return testingCert{}, err
 	}
-	certFile.Write(pemTestingCertificate[:len(pemTestingCertificate)-10])
 
-	keyFile, err := os.CreateTemp(dir, "tmpfile-")
+	key, err := writeTempFile(dir, pemTestingKey[:len(pemTestingKey)-10])
 	if err != nil {
 		return testingCert{}, err
 	}
-	keyFile.Write(pemTestingKey[:len(pemTestingKey)-10])
 
-	caFile, err := os.CreateTemp(dir, "tmpfile-")
+	ca, err := writeTempFile(dir, pemTestingCa)
 	if err != nil {
 		return testingCert{}, err
 	}
-	caFile.Write(pemTestingCa)
 
-	testingCert := testingCert{
-		cert: certFile.Name(),
-		key:  keyFile.Name(),
-		ca:   caFile.Name(),
-	}
-	return testingCert, nil
+	return testingCert{cert: cert, key: key, ca: ca}, nil
 }
 
 func Test_loadCertAndCAFromPath(t *testing.T) {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 
 	"github.com/ooni/minivpn/internal/bytesx"
@@ -41,6 +42,24 @@ func MarshalPacket(p *model.Packet, packetAuth *ControlChannelSecurity) ([]byte,
 			return nil, fmt.Errorf("%w: %s\n", ErrMarshalPacket, err)
 		}
 
+		// Debug: show packet structure being marshaled
+		if debugEnabled("MINIVPN_DEBUG_PACKET") {
+			log.Printf("[DEBUG-PACKET] MarshalPacket:")
+			log.Printf("[DEBUG-PACKET]   Opcode: %s", p.Opcode)
+			log.Printf("[DEBUG-PACKET]   KeyID: %d", p.KeyID)
+			log.Printf("[DEBUG-PACKET]   LocalSessionID: %x", p.LocalSessionID)
+			log.Printf("[DEBUG-PACKET]   ReplayPacketID: %d", p.ReplayPacketID)
+			log.Printf("[DEBUG-PACKET]   Timestamp: %d", p.Timestamp)
+			log.Printf("[DEBUG-PACKET]   ACKs: %v", p.ACKs)
+			log.Printf("[DEBUG-PACKET]   RemoteSessionID: %x", p.RemoteSessionID)
+			log.Printf("[DEBUG-PACKET]   ID: %d", p.ID)
+			log.Printf("[DEBUG-PACKET]   Payload (%d bytes): %x", len(p.Payload), p.Payload)
+			log.Printf("[DEBUG-PACKET]   header bytes: %x", header)
+			log.Printf("[DEBUG-PACKET]   replay bytes: %x", replay)
+			log.Printf("[DEBUG-PACKET]   ctrl bytes: %x", ctrl)
+			log.Printf("[DEBUG-PACKET]   Security mode: %d", packetAuth.Mode)
+		}
+
 		switch packetAuth.Mode {
 		case ControlSecurityModeNone:
 			buf.Write(header)
@@ -48,6 +67,12 @@ func MarshalPacket(p *model.Packet, packetAuth *ControlChannelSecurity) ([]byte,
 
 		case ControlSecurityModeTLSAuth:
 			digest := GenerateTLSAuthDigest(packetAuth.LocalDigestKey, header, replay, ctrl)
+
+			// Debug: show tls-auth wire format
+			if debugEnabled("MINIVPN_DEBUG_PACKET") {
+				log.Printf("[DEBUG-PACKET] TLS-AUTH wire format: header || hmac || replay || ctrl")
+				log.Printf("[DEBUG-PACKET]   HMAC digest: %x", digest)
+			}
 
 			buf.Write(header)
 			buf.Write(digest[:])
@@ -224,7 +249,20 @@ func validateTLSAuthDigest(p *model.Packet, key *ControlChannelKey, got *SHA1HMA
 	}
 
 	want := GenerateTLSAuthDigest(key, header, replay, ctrl)
-	return *got == want, nil
+	match := *got == want
+
+	// Debug: show HMAC validation details on mismatch
+	if !match && debugEnabled("MINIVPN_DEBUG_HMAC") {
+		log.Printf("[DEBUG-HMAC] validateTLSAuthDigest MISMATCH!")
+		log.Printf("[DEBUG-HMAC]   Got:  %x", got[:])
+		log.Printf("[DEBUG-HMAC]   Want: %x", want[:])
+		log.Printf("[DEBUG-HMAC]   Key used (first 20): %x", key[:20])
+		log.Printf("[DEBUG-HMAC]   header: %x", header)
+		log.Printf("[DEBUG-HMAC]   replay: %x", replay)
+		log.Printf("[DEBUG-HMAC]   ctrl: %x", ctrl)
+	}
+
+	return match, nil
 
 }
 
