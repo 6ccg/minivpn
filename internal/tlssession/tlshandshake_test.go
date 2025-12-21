@@ -212,83 +212,6 @@ func writeTestingCertsBadCert(dir string) (testingCert, error) {
 	return testingCert{cert: cert, key: key, ca: ca}, nil
 }
 
-func Test_loadCertAndCAFromPath(t *testing.T) {
-	type args struct {
-		pth certPaths
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    *certConfig
-		wantErr error
-	}{
-		{
-			name: "bad ca (non existent file) should fail",
-			args: func() args {
-				crt, err := writeTestingCertsBadCAFile(t.TempDir())
-				if err != nil {
-					t.Errorf("error while testing: %v", err)
-				}
-				return args{pth: certPaths{crt.cert, crt.key, crt.ca}}
-
-			}(),
-			want:    nil,
-			wantErr: ErrBadCA,
-		},
-		{
-			name: "bad ca (malformed) should fail",
-			args: func() args {
-				crt, err := writeTestingCertsBadCA(t.TempDir())
-				if err != nil {
-					t.Errorf("error while testing: %v", err)
-				}
-				return args{pth: certPaths{crt.cert, crt.key, crt.ca}}
-
-			}(),
-			want:    nil,
-			wantErr: ErrBadCA,
-		},
-		{
-			name: "bad key",
-			args: func() args {
-				crt, err := writeTestingCertsBadKey(t.TempDir())
-				if err != nil {
-					t.Errorf("error while testing: %v", err)
-				}
-				return args{pth: certPaths{crt.cert, crt.key, crt.ca}}
-
-			}(),
-			want:    nil,
-			wantErr: ErrBadKeypair,
-		},
-		{
-			name: "bad cert",
-			args: func() args {
-				crt, err := writeTestingCertsBadCert(t.TempDir())
-				if err != nil {
-					t.Errorf("error while testing: %v", err)
-				}
-				return args{pth: certPaths{crt.cert, crt.key, crt.ca}}
-
-			}(),
-			want:    nil,
-			wantErr: ErrBadKeypair,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := loadCertAndCAFromPath(tt.args.pth)
-			if !errors.Is(err, tt.wantErr) {
-				t.Errorf("loadCertAndCA() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("loadCertAndCA() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
 func Test_loadCertAndCAFromBytes(t *testing.T) {
 	type args struct {
 		crt certBytes
@@ -359,11 +282,23 @@ func Test_initTLSLoadTestCertificates(t *testing.T) {
 		if err != nil {
 			t.Errorf("error while testing: %v", err)
 		}
+		certBytes, err := os.ReadFile(crt.cert)
+		if err != nil {
+			t.Fatalf("cannot read cert: %v", err)
+		}
+		keyBytes, err := os.ReadFile(crt.key)
+		if err != nil {
+			t.Fatalf("cannot read key: %v", err)
+		}
+		caBytes, err := os.ReadFile(crt.ca)
+		if err != nil {
+			t.Fatalf("cannot read ca: %v", err)
+		}
 		cfg, err := newCertConfigFromOptions(
 			&config.OpenVPNOptions{
-				CertPath: crt.cert,
-				KeyPath:  crt.key,
-				CAPath:   crt.ca,
+				Cert: certBytes,
+				Key:  keyBytes,
+				CA:   caBytes,
 			})
 		if err != nil {
 			t.Errorf("error while testing: %v", err)

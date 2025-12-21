@@ -2,7 +2,6 @@ package datachannel
 
 import (
 	"hash"
-	"math"
 	"sync"
 
 	"github.com/ooni/minivpn/internal/model"
@@ -23,9 +22,10 @@ type dataChannelState struct {
 	hmacKeyLocal    keySlot
 	hmacKeyRemote   keySlot
 
-	// TODO(ainghazal): we need to keep a local packetID too. It should be separated from the control channel.
-	// TODO: move this to sessionManager perhaps?
-	remotePacketID model.PacketID
+	// replayFilter provides sliding window replay protection for both AEAD and non-AEAD modes.
+	// For UDP: uses backtrack mode to allow out-of-order packets within the window.
+	// For TCP: uses sequential mode requiring strictly increasing packet IDs.
+	replayFilter *replayFilter
 
 	hash func() hash.Hash
 	mu   sync.Mutex
@@ -34,23 +34,54 @@ type dataChannelState struct {
 	// keyID           int
 }
 
-// SetRemotePacketID stores the passed packetID internally.
-func (dcs *dataChannelState) SetRemotePacketID(id model.PacketID) {
+// initReplayFilter initializes the replay filter with the appropriate mode.
+// backtrackMode should be true for UDP (allows out-of-order), false for TCP (sequential).
+func (dcs *dataChannelState) initReplayFilter(backtrackMode bool) {
 	dcs.mu.Lock()
 	defer dcs.mu.Unlock()
-	dcs.remotePacketID = model.PacketID(id)
+	dcs.replayFilter = newReplayFilter(DefaultSeqBacktrack, backtrackMode)
 }
 
-// RemotePacketID returns the last known remote packetID. It returns an error
-// if the stored packet id has reached the maximum capacity of the packetID
-// type.
+// CheckReplay tests whether a packet ID should be accepted or rejected.
+// Returns nil if the packet is valid, ErrReplayAttack if it's a replay.
+func (dcs *dataChannelState) CheckReplay(id model.PacketID) error {
+	dcs.mu.Lock()
+	defer dcs.mu.Unlock()
+	if dcs.replayFilter == nil {
+		// Lazy initialization with backtrack mode (UDP-safe default)
+		dcs.replayFilter = newReplayFilter(DefaultSeqBacktrack, true)
+	}
+	return dcs.replayFilter.Check(id)
+}
+
+// RemotePacketID returns the highest packet ID seen so far.
+// Deprecated: Use CheckReplay instead for replay protection.
 func (dcs *dataChannelState) RemotePacketID() (model.PacketID, error) {
 	dcs.mu.Lock()
 	defer dcs.mu.Unlock()
-	pid := dcs.remotePacketID
-	if pid == math.MaxUint32 {
-		// we reached the max packetID, increment will overflow
-		return 0, ErrExpiredKey
+	if dcs.replayFilter == nil {
+		return 0, nil
 	}
-	return pid, nil
+	return dcs.replayFilter.MaxID(), nil
+}
+
+// SetRemotePacketID is deprecated and now a no-op.
+// The replayFilter automatically tracks seen packet IDs.
+// Deprecated: Use CheckReplay instead.
+func (dcs *dataChannelState) SetRemotePacketID(id model.PacketID) {
+	// No-op: replay filter manages state internally
+}
+
+// setInitialPacketIDForTest initializes the replay filter with packets already seen up to maxID.
+// This is only for testing purposes.
+func (dcs *dataChannelState) setInitialPacketIDForTest(maxID model.PacketID) {
+	dcs.mu.Lock()
+	defer dcs.mu.Unlock()
+	if dcs.replayFilter == nil {
+		dcs.replayFilter = newReplayFilter(DefaultSeqBacktrack, true)
+	}
+	// Mark all packets from 1 to maxID as seen
+	for i := model.PacketID(1); i <= maxID; i++ {
+		dcs.replayFilter.Check(i)
+	}
 }

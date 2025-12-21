@@ -255,14 +255,21 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 	if debugWireEnabled() {
 		log.Printf("[DEBUG-WIRE] <<< RECV raw (%d bytes): %x", len(rawPacket), rawPacket)
 		// Break down the packet for tls-auth
-		if ws.sessionManager.PacketAuth().Mode == wire.ControlSecurityModeTLSAuth && len(rawPacket) >= 38 {
-			log.Printf("[DEBUG-WIRE] <<< RECV breakdown (tls-auth):")
-			log.Printf("[DEBUG-WIRE]     opcode/key (1): %x", rawPacket[0:1])
-			log.Printf("[DEBUG-WIRE]     session_id (8): %x", rawPacket[1:9])
-			log.Printf("[DEBUG-WIRE]     hmac (20): %x", rawPacket[9:29])
-			log.Printf("[DEBUG-WIRE]     replay_id (4): %x", rawPacket[29:33])
-			log.Printf("[DEBUG-WIRE]     timestamp (4): %x", rawPacket[33:37])
-			log.Printf("[DEBUG-WIRE]     rest (%d): %x", len(rawPacket)-37, rawPacket[37:])
+		if ws.sessionManager.PacketAuth().Mode == wire.ControlSecurityModeTLSAuth {
+			digestSize := ws.sessionManager.PacketAuth().TLSAuthDigest.Size()
+			if digestSize == 0 {
+				digestSize = 20
+			}
+			minLen := 9 + digestSize + 8
+			if len(rawPacket) >= minLen {
+				log.Printf("[DEBUG-WIRE] <<< RECV breakdown (tls-auth):")
+				log.Printf("[DEBUG-WIRE]     opcode/key (1): %x", rawPacket[0:1])
+				log.Printf("[DEBUG-WIRE]     session_id (8): %x", rawPacket[1:9])
+				log.Printf("[DEBUG-WIRE]     hmac (%d): %x", digestSize, rawPacket[9:9+digestSize])
+				log.Printf("[DEBUG-WIRE]     replay_id (4): %x", rawPacket[9+digestSize:13+digestSize])
+				log.Printf("[DEBUG-WIRE]     timestamp (4): %x", rawPacket[13+digestSize:17+digestSize])
+				log.Printf("[DEBUG-WIRE]     rest (%d): %x", len(rawPacket)-(17+digestSize), rawPacket[17+digestSize:])
+			}
 		}
 	}
 
@@ -401,14 +408,21 @@ func (ws *workersState) serializeAndEmit(packet *model.Packet) error {
 	if debugWireEnabled() {
 		log.Printf("[DEBUG-WIRE] >>> SEND raw (%d bytes): %x", len(rawPacket), rawPacket)
 		// Break down the packet for tls-auth
-		if ws.sessionManager.PacketAuth().Mode == wire.ControlSecurityModeTLSAuth && len(rawPacket) >= 38 {
-			log.Printf("[DEBUG-WIRE] >>> SEND breakdown (tls-auth):")
-			log.Printf("[DEBUG-WIRE]     opcode/key (1): %x", rawPacket[0:1])
-			log.Printf("[DEBUG-WIRE]     session_id (8): %x", rawPacket[1:9])
-			log.Printf("[DEBUG-WIRE]     hmac (20): %x", rawPacket[9:29])
-			log.Printf("[DEBUG-WIRE]     replay_id (4): %x", rawPacket[29:33])
-			log.Printf("[DEBUG-WIRE]     timestamp (4): %x", rawPacket[33:37])
-			log.Printf("[DEBUG-WIRE]     rest (%d): %x", len(rawPacket)-37, rawPacket[37:])
+		if ws.sessionManager.PacketAuth().Mode == wire.ControlSecurityModeTLSAuth {
+			digestSize := ws.sessionManager.PacketAuth().TLSAuthDigest.Size()
+			if digestSize == 0 {
+				digestSize = 20
+			}
+			minLen := 9 + digestSize + 8
+			if len(rawPacket) >= minLen {
+				log.Printf("[DEBUG-WIRE] >>> SEND breakdown (tls-auth):")
+				log.Printf("[DEBUG-WIRE]     opcode/key (1): %x", rawPacket[0:1])
+				log.Printf("[DEBUG-WIRE]     session_id (8): %x", rawPacket[1:9])
+				log.Printf("[DEBUG-WIRE]     hmac (%d): %x", digestSize, rawPacket[9:9+digestSize])
+				log.Printf("[DEBUG-WIRE]     replay_id (4): %x", rawPacket[9+digestSize:13+digestSize])
+				log.Printf("[DEBUG-WIRE]     timestamp (4): %x", rawPacket[13+digestSize:17+digestSize])
+				log.Printf("[DEBUG-WIRE]     rest (%d): %x", len(rawPacket)-(17+digestSize), rawPacket[17+digestSize:])
+			}
 		}
 	}
 

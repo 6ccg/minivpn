@@ -3,17 +3,9 @@ package config
 import (
 	"errors"
 	"os"
-	fp "path/filepath"
 	"reflect"
 	"testing"
 )
-
-func writeDummyCertFiles(d string) {
-	os.WriteFile(fp.Join(d, "ca.crt"), []byte("dummy"), 0600)
-	os.WriteFile(fp.Join(d, "cert.pem"), []byte("dummy"), 0600)
-	os.WriteFile(fp.Join(d, "key.pem"), []byte("dummy"), 0600)
-	os.WriteFile(fp.Join(d, "ta.pem"), []byte("dummy"), 0600)
-}
 
 func TestOptions_String(t *testing.T) {
 	type fields struct {
@@ -22,10 +14,6 @@ func TestOptions_String(t *testing.T) {
 		Proto     Proto
 		Username  string
 		Password  string
-		CA        string
-		Cert      string
-		Key       string
-		TLSAuth   string
 		Cipher    string
 		Auth      string
 		TLSMaxVer string
@@ -72,24 +60,29 @@ func TestOptions_String(t *testing.T) {
 			},
 			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,lzo-comp no",
 		},
+		{
+			name: "proto udp6",
+			fields: fields{
+				Cipher: "AES-128-GCM",
+				Auth:   "sha512",
+				Proto:  ProtoUDP6,
+			},
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv6,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			o := &OpenVPNOptions{
-				Remote:      tt.fields.Remote,
-				Port:        tt.fields.Port,
-				Proto:       tt.fields.Proto,
-				Username:    tt.fields.Username,
-				Password:    tt.fields.Password,
-				CAPath:      tt.fields.CA,
-				CertPath:    tt.fields.Cert,
-				KeyPath:     tt.fields.Key,
-				TLSAuthPath: tt.fields.TLSAuth,
-				Compress:    tt.fields.Compress,
-				Cipher:      tt.fields.Cipher,
-				Auth:        tt.fields.Auth,
-				TLSMaxVer:   tt.fields.TLSMaxVer,
-				ProxyOBFS4:  tt.fields.ProxyOBFS4,
+				Remote:     tt.fields.Remote,
+				Port:       tt.fields.Port,
+				Proto:      tt.fields.Proto,
+				Username:   tt.fields.Username,
+				Password:   tt.fields.Password,
+				Compress:   tt.fields.Compress,
+				Cipher:     tt.fields.Cipher,
+				Auth:       tt.fields.Auth,
+				TLSMaxVer:  tt.fields.TLSMaxVer,
+				ProxyOBFS4: tt.fields.ProxyOBFS4,
 			}
 			if got := o.ServerOptionsString(); got != tt.want {
 				t.Errorf("Options.string() = %v, want %v", got, tt.want)
@@ -103,14 +96,22 @@ func TestGetOptionsFromLines(t *testing.T) {
 		d := t.TempDir()
 		l := []string{
 			"remote 0.0.0.0 1194",
+			"proto udp4",
 			"cipher AES-256-GCM",
 			"auth SHA512",
-			"ca ca.crt",
-			"cert cert.pem",
-			"key key.pem",
-			"tls-auth ta.pem",
+			"<ca>",
+			"ca_string",
+			"</ca>",
+			"<cert>",
+			"cert_string",
+			"</cert>",
+			"<key>",
+			"key_string",
+			"</key>",
+			"<tls-auth>",
+			"ta_string",
+			"</tls-auth>",
 		}
-		writeDummyCertFiles(d)
 		opt, err := getOptionsFromLines(l, d)
 		if err != nil {
 			t.Errorf("Good options should not fail: %s", err)
@@ -123,6 +124,47 @@ func TestGetOptionsFromLines(t *testing.T) {
 		}
 		if opt.Compress != CompressionEmpty {
 			t.Errorf("Expected compression empty")
+		}
+	})
+}
+
+func TestGetOptionsFromLinesKeyDirection(t *testing.T) {
+	t.Run("key-direction is parsed", func(t *testing.T) {
+		l := []string{
+			"key-direction 1",
+		}
+		o, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("Good options should not fail: %s", err)
+		}
+		if o.KeyDirection == nil || *o.KeyDirection != 1 {
+			t.Fatalf("Expected KeyDirection=1, got: %v", o.KeyDirection)
+		}
+	})
+
+	t.Run("tls-auth inline direction sets key-direction", func(t *testing.T) {
+		l := []string{
+			"tls-auth inline 0",
+			"<tls-auth>",
+			"ta_string",
+			"</tls-auth>",
+		}
+		o, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("Good options should not fail: %s", err)
+		}
+		if o.KeyDirection == nil || *o.KeyDirection != 0 {
+			t.Fatalf("Expected KeyDirection=0, got: %v", o.KeyDirection)
+		}
+	})
+
+	t.Run("conflicting key-direction values fail", func(t *testing.T) {
+		l := []string{
+			"key-direction 0",
+			"tls-auth inline 1",
+		}
+		if _, err := getOptionsFromLines(l, t.TempDir()); err == nil {
+			t.Fatalf("Expected conflicting key-direction to fail")
 		}
 	})
 }
@@ -158,6 +200,39 @@ func TestGetOptionsFromLinesInlineCerts(t *testing.T) {
 		}
 		if string(o.TLSAuth) != "ta_string\n" {
 			t.Errorf("Expected ta_string, got: %s.", string(o.Key))
+		}
+	})
+}
+
+func TestGetOptionsFromLinesInlineAuthUserPass(t *testing.T) {
+	t.Run("inline auth-user-pass block is parsed", func(t *testing.T) {
+		l := []string{
+			"<ca>",
+			"ca_string",
+			"</ca>",
+			"<auth-user-pass>",
+			"user",
+			"pass",
+			"</auth-user-pass>",
+		}
+		o, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("Good options should not fail: %s", err)
+		}
+		if o.Username != "user" || o.Password != "pass" {
+			t.Fatalf("Expected inline username/password to be parsed, got user=%q pass=%q", o.Username, o.Password)
+		}
+		if !o.AuthUserPass {
+			t.Fatalf("Expected AuthUserPass to be true")
+		}
+	})
+
+	t.Run("auth-user-pass file paths are rejected", func(t *testing.T) {
+		l := []string{
+			"auth-user-pass auth.txt",
+		}
+		if _, err := getOptionsFromLines(l, t.TempDir()); err == nil {
+			t.Fatalf("Expected auth-user-pass file paths to be rejected")
 		}
 	})
 }
@@ -345,6 +420,28 @@ func Test_parseProto(t *testing.T) {
 		}
 	})
 
+	t.Run("proto udp4 is parsed as udp4", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseProto([]string{"udp4"}, opt)
+		if !errors.Is(err, nil) {
+			t.Errorf("parseProto(): wantErr: %v, got %v", nil, err)
+		}
+		if o.Proto != ProtoUDP4 {
+			t.Errorf("parseProto(): want %v, got %v", ProtoUDP4, o.Proto)
+		}
+	})
+
+	t.Run("proto udp6 is parsed as udp6", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseProto([]string{"udp6"}, opt)
+		if !errors.Is(err, nil) {
+			t.Errorf("parseProto(): wantErr: %v, got %v", nil, err)
+		}
+		if o.Proto != ProtoUDP6 {
+			t.Errorf("parseProto(): want %v, got %v", ProtoUDP6, o.Proto)
+		}
+	})
+
 	t.Run("proto tcp is parsed as tcp", func(t *testing.T) {
 		opt := &OpenVPNOptions{}
 		o, err := parseProto([]string{"tcp"}, opt)
@@ -353,6 +450,48 @@ func Test_parseProto(t *testing.T) {
 		}
 		if o.Proto != ProtoTCP {
 			t.Errorf("parseProto(): wantErr %v, got %v", nil, err)
+		}
+	})
+
+	t.Run("proto tcp-client is parsed as tcp", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseProto([]string{"tcp-client"}, opt)
+		if !errors.Is(err, nil) {
+			t.Errorf("parseProto(): wantErr: %v, got %v", nil, err)
+		}
+		if o.Proto != ProtoTCP {
+			t.Errorf("parseProto(): want %v, got %v", ProtoTCP, o.Proto)
+		}
+	})
+
+	t.Run("proto tcp4-client is parsed as tcp4", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseProto([]string{"tcp4-client"}, opt)
+		if !errors.Is(err, nil) {
+			t.Errorf("parseProto(): wantErr: %v, got %v", nil, err)
+		}
+		if o.Proto != ProtoTCP4 {
+			t.Errorf("parseProto(): want %v, got %v", ProtoTCP4, o.Proto)
+		}
+	})
+
+	t.Run("proto tcp6-client is parsed as tcp6", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseProto([]string{"tcp6-client"}, opt)
+		if !errors.Is(err, nil) {
+			t.Errorf("parseProto(): wantErr: %v, got %v", nil, err)
+		}
+		if o.Proto != ProtoTCP6 {
+			t.Errorf("parseProto(): want %v, got %v", ProtoTCP6, o.Proto)
+		}
+	})
+
+	t.Run("proto tcp-server should fail", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseProto([]string{"tcp-server"}, opt)
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseProto(): wantErr: %v, got %v", wantErr, err)
 		}
 	})
 
@@ -461,19 +600,53 @@ func Test_parseKey(t *testing.T) {
 }
 
 func Test_parseTLSAuth(t *testing.T) {
-	t.Run("more than one part should fail", func(t *testing.T) {
-		_, err := parseTLSAuth([]string{"one", "two"}, &OpenVPNOptions{}, "")
-		wantErr := ErrBadConfig
-		if !errors.Is(err, wantErr) {
-			t.Errorf("parseCA(): want %v, got %v", wantErr, err)
-		}
-	})
-
-	t.Run("empty part should fail", func(t *testing.T) {
+	t.Run("empty args should fail", func(t *testing.T) {
 		_, err := parseTLSAuth([]string{}, &OpenVPNOptions{}, "")
 		wantErr := ErrBadConfig
 		if !errors.Is(err, wantErr) {
-			t.Errorf("parseCA(): want %v, got %v", wantErr, err)
+			t.Errorf("parseTLSAuth(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("file paths should fail", func(t *testing.T) {
+		_, err := parseTLSAuth([]string{"ta.key"}, &OpenVPNOptions{}, "")
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseTLSAuth(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("inline should succeed", func(t *testing.T) {
+		_, err := parseTLSAuth([]string{"inline"}, &OpenVPNOptions{}, "")
+		if err != nil {
+			t.Errorf("parseTLSAuth(): want %v, got %v", nil, err)
+		}
+	})
+
+	t.Run("inline with direction should set key-direction", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseTLSAuth([]string{"inline", "1"}, opt, "")
+		if err != nil {
+			t.Errorf("parseTLSAuth(): want %v, got %v", nil, err)
+		}
+		if opt.KeyDirection == nil || *opt.KeyDirection != 1 {
+			t.Errorf("parseTLSAuth(): expected KeyDirection=1, got %v", opt.KeyDirection)
+		}
+	})
+
+	t.Run("invalid direction should fail", func(t *testing.T) {
+		_, err := parseTLSAuth([]string{"inline", "2"}, &OpenVPNOptions{}, "")
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseTLSAuth(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("more than two parts should fail", func(t *testing.T) {
+		_, err := parseTLSAuth([]string{"inline", "0", "extra"}, &OpenVPNOptions{}, "")
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseTLSAuth(): want %v, got %v", wantErr, err)
 		}
 	})
 }
@@ -553,88 +726,31 @@ func Test_parseAuth(t *testing.T) {
 }
 
 func Test_parseAuthUser(t *testing.T) {
-	makeCreds := func(credStr string) string {
-		f, err := os.CreateTemp(t.TempDir(), "tmpfile-")
-		if err != nil {
-			t.Fatal(err)
+	t.Run("no args should succeed and mark AuthUserPass", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		if _, err := parseAuthUser([]string{}, opt, ""); err != nil {
+			t.Fatalf("parseAuthUser(): want %v, got %v", nil, err)
 		}
-		if _, err := f.Write([]byte(credStr)); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
+		if !opt.AuthUserPass {
+			t.Fatalf("parseAuthUser(): expected AuthUserPass to be true")
 		}
-		if err := f.Close(); err != nil {
-			t.Fatal(err)
-		}
-		return f.Name()
-	}
+	})
 
-	baseDir := func() string {
-		return os.TempDir()
-	}
+	t.Run("file paths should be rejected", func(t *testing.T) {
+		_, err := parseAuthUser([]string{"auth.txt"}, &OpenVPNOptions{}, "")
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("parseAuthUser(): wantErr %v, got %v", wantErr, err)
+		}
+	})
 
-	type args struct {
-		p []string
-		o *OpenVPNOptions
-		d string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		wantErr error
-	}{
-		{
-			name: "parse good auth",
-			args: args{
-				p: []string{makeCreds("foo\nbar\n")},
-				o: &OpenVPNOptions{},
-				d: baseDir(),
-			},
-			wantErr: nil,
-		},
-		{
-			name: "path traversal should fail",
-			args: args{
-				p: []string{"/tmp/../etc/passwd"},
-				o: &OpenVPNOptions{},
-				d: baseDir(),
-			},
-			wantErr: ErrBadConfig,
-		},
-		{
-			name: "parse empty file should fail",
-			args: args{
-				p: []string{""},
-				o: &OpenVPNOptions{},
-				d: baseDir(),
-			},
-			wantErr: ErrBadConfig,
-		},
-		{
-			name: "parse empty parts should fail",
-			args: args{
-				p: []string{},
-				o: &OpenVPNOptions{},
-				d: baseDir(),
-			},
-			wantErr: ErrBadConfig,
-		},
-		{
-			name: "parse less than two lines should fail",
-			args: args{
-				p: []string{makeCreds("foo\n")},
-				o: &OpenVPNOptions{},
-				d: baseDir(),
-			},
-			wantErr: ErrBadConfig,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := parseAuthUser(tt.args.p, tt.args.o, tt.args.d); !errors.Is(err, tt.wantErr) {
-				t.Errorf("parseAuthUser() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
+	t.Run("multiple args should be rejected", func(t *testing.T) {
+		_, err := parseAuthUser([]string{"a", "b"}, &OpenVPNOptions{}, "")
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("parseAuthUser(): wantErr %v, got %v", wantErr, err)
+		}
+	})
 }
 
 // TODO(ainghazal): either check returned value or check mutation of the options argument.
@@ -818,44 +934,41 @@ func Test_isSubdir(t *testing.T) {
 	}
 }
 
-func TestOpenVPNOptions_ShouldLoadCertsFromPath(t *testing.T) {
-	t.Run("cert key and ca strings should return true", func(t *testing.T) {
-		opt := OpenVPNOptions{CAPath: "/path", KeyPath: "/path", CertPath: "/path"}
-		if !opt.ShouldLoadCertsFromPath() {
-			t.Error("expected true")
-		}
-	})
-	t.Run("one of the three missing should return false", func(t *testing.T) {
-		opt := OpenVPNOptions{CAPath: "", KeyPath: "/path", CertPath: "/path"}
-		if opt.ShouldLoadCertsFromPath() {
-			t.Error("expected false")
-		}
-	})
-	t.Run("none set of ca key cert should return false", func(t *testing.T) {
-		opt := OpenVPNOptions{CAPath: "", KeyPath: "", CertPath: ""}
-		if opt.ShouldLoadCertsFromPath() {
-			t.Error("expected false")
-		}
-	})
-}
-
 func TestOpenVPNOptions_HasAuthInfo(t *testing.T) {
-	t.Run("username and password should return true", func(t *testing.T) {
+	t.Run("username and password without ca should return false", func(t *testing.T) {
 		opt := OpenVPNOptions{Username: "user", Password: "password"}
-		if !opt.HasAuthInfo() {
-			t.Error("expected true")
+		if opt.HasAuthInfo() {
+			t.Error("expected false")
 		}
 	})
-	t.Run("paths for ca cert and key should return true", func(t *testing.T) {
-		opt := OpenVPNOptions{CAPath: "/path]", KeyPath: "/path", CertPath: "/path"}
+	t.Run("username and password with ca should return true", func(t *testing.T) {
+		opt := OpenVPNOptions{CA: []byte("ca"), Username: "user", Password: "password"}
 		if !opt.HasAuthInfo() {
 			t.Error("expected true")
 		}
 	})
 	t.Run("non-empty ca, cert and key should return true", func(t *testing.T) {
-		opt := OpenVPNOptions{CA: []byte("stuff"), Key: []byte("stuff"), Cert: []byte("/path")}
+		opt := OpenVPNOptions{CA: []byte("ca"), Cert: []byte("cert"), Key: []byte("key")}
 		if !opt.HasAuthInfo() {
 			t.Error("expected true")
+		}
+	})
+	t.Run("auth-user-pass requires username and password even with cert and key", func(t *testing.T) {
+		opt := OpenVPNOptions{CA: []byte("ca"), Cert: []byte("cert"), Key: []byte("key"), AuthUserPass: true}
+		if opt.HasAuthInfo() {
+			t.Error("expected false")
+		}
+	})
+	t.Run("auth-user-pass with username, password and ca should return true", func(t *testing.T) {
+		opt := OpenVPNOptions{CA: []byte("ca"), Username: "user", Password: "password", AuthUserPass: true}
+		if !opt.HasAuthInfo() {
+			t.Error("expected true")
+		}
+	})
+	t.Run("ca only should return false", func(t *testing.T) {
+		opt := OpenVPNOptions{CA: []byte("ca")}
+		if opt.HasAuthInfo() {
+			t.Error("expected false")
 		}
 	})
 	t.Run("empty values should return false", func(t *testing.T) {

@@ -2,6 +2,8 @@ package wire
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/hmac"
 	"errors"
 	"fmt"
 	"io"
@@ -66,7 +68,7 @@ func MarshalPacket(p *model.Packet, packetAuth *ControlChannelSecurity) ([]byte,
 			buf.Write(ctrl)
 
 		case ControlSecurityModeTLSAuth:
-			digest := GenerateTLSAuthDigest(packetAuth.LocalDigestKey, header, replay, ctrl)
+			digest := GenerateTLSAuthDigest(packetAuth.TLSAuthDigest, packetAuth.LocalDigestKey, header, replay, ctrl)
 
 			// Debug: show tls-auth wire format
 			if debugEnabled("MINIVPN_DEBUG_PACKET") {
@@ -75,7 +77,7 @@ func MarshalPacket(p *model.Packet, packetAuth *ControlChannelSecurity) ([]byte,
 			}
 
 			buf.Write(header)
-			buf.Write(digest[:])
+			buf.Write(digest)
 			buf.Write(replay)
 			buf.Write(ctrl)
 
@@ -180,8 +182,12 @@ func parseControlOrACKPacket(opcode model.Opcode, keyID byte, payload []byte, pa
 			return p, err
 		}
 	case ControlSecurityModeTLSAuth:
-		var digestGot SHA1HMACDigest
-		if _, err := io.ReadFull(buf, digestGot[:]); err != nil {
+		digestSize := packetAuth.TLSAuthDigest.Size()
+		if digestSize == 0 {
+			digestSize = 20
+		}
+		digestGot := make([]byte, digestSize)
+		if _, err := io.ReadFull(buf, digestGot); err != nil {
 			return p, fmt.Errorf("%w: %s", ErrParsePacket, err)
 		}
 
@@ -196,7 +202,7 @@ func parseControlOrACKPacket(opcode model.Opcode, keyID byte, payload []byte, pa
 		// matches what we recieved from the server. Invalid digest could indicate
 		// that the server is not in possession of pre-shared key OR packet contents
 		// has been tampered with
-		match, err := validateTLSAuthDigest(p, packetAuth.RemoteDigestKey, &digestGot)
+		match, err := validateTLSAuthDigest(p, packetAuth.RemoteDigestKey, packetAuth.TLSAuthDigest, digestGot)
 		if err != nil || !match {
 			return p, fmt.Errorf("%w: packet digest (hmac) is not valid", ErrParsePacket)
 		}
@@ -240,7 +246,12 @@ func parseControlOrACKPacket(opcode model.Opcode, keyID byte, payload []byte, pa
 	return p, nil
 }
 
-func validateTLSAuthDigest(p *model.Packet, key *ControlChannelKey, got *SHA1HMACDigest) (bool, error) {
+func validateTLSAuthDigest(p *model.Packet, key *ControlChannelKey, digest crypto.Hash, got []byte) (bool, error) {
+	if digest == 0 {
+		digest = crypto.SHA1
+	}
+	keyLen := digest.Size()
+
 	header := headerBytes(p)
 	replay := replayProtectionBytes(p)
 	ctrl, err := controlMessageBytes(p)
@@ -248,15 +259,16 @@ func validateTLSAuthDigest(p *model.Packet, key *ControlChannelKey, got *SHA1HMA
 		return false, err
 	}
 
-	want := GenerateTLSAuthDigest(key, header, replay, ctrl)
-	match := *got == want
+	want := GenerateTLSAuthDigest(digest, key, header, replay, ctrl)
+	match := hmac.Equal(got, want)
 
 	// Debug: show HMAC validation details on mismatch
 	if !match && debugEnabled("MINIVPN_DEBUG_HMAC") {
 		log.Printf("[DEBUG-HMAC] validateTLSAuthDigest MISMATCH!")
-		log.Printf("[DEBUG-HMAC]   Got:  %x", got[:])
-		log.Printf("[DEBUG-HMAC]   Want: %x", want[:])
-		log.Printf("[DEBUG-HMAC]   Key used (first 20): %x", key[:20])
+		log.Printf("[DEBUG-HMAC]   Got:  %x", got)
+		log.Printf("[DEBUG-HMAC]   Want: %x", want)
+		log.Printf("[DEBUG-HMAC]   Digest: %s", digest.String())
+		log.Printf("[DEBUG-HMAC]   Key used (first %d): %x", keyLen, key[:keyLen])
 		log.Printf("[DEBUG-HMAC]   header: %x", header)
 		log.Printf("[DEBUG-HMAC]   replay: %x", replay)
 		log.Printf("[DEBUG-HMAC]   ctrl: %x", ctrl)

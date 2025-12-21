@@ -8,18 +8,25 @@ import (
 // datagramConn wraps a datagram socket and implements OpenVPN framing.
 type datagramConn struct {
 	net.Conn
+	scratch []byte
 }
 
 var _ FramingConn = &datagramConn{}
 
 // ReadRawPacket implements FramingConn
 func (c *datagramConn) ReadRawPacket() ([]byte, error) {
-	buffer := make([]byte, math.MaxUint16) // maximum UDP datagram size
-	count, err := c.Read(buffer)
+	if c.scratch == nil {
+		// maximum UDP datagram size
+		c.scratch = make([]byte, math.MaxUint16)
+	}
+	count, err := c.Read(c.scratch)
 	if err != nil {
 		return nil, err
 	}
-	pkt := buffer[:count]
+	// Return a right-sized copy to avoid retaining a 64KiB backing array for
+	// small packets and reduce GC pressure.
+	pkt := make([]byte, count)
+	copy(pkt, c.scratch[:count])
 	return pkt, nil
 }
 

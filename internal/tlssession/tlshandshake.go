@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net"
-	"os"
 
 	"github.com/ooni/minivpn/internal/runtimex"
 	"github.com/ooni/minivpn/pkg/config"
@@ -44,38 +43,6 @@ func certVerifyOptionsNoCommonNameCheck() x509.VerifyOptions {
 // use; by default it configures VerifyOptions to skip the DNSName check.
 var certVerifyOptions = certVerifyOptionsNoCommonNameCheck
 
-// certPaths holds the paths for the cert, key, and ca used for OpenVPN
-// certificate authentication.
-type certPaths struct {
-	certPath string
-	keyPath  string
-	caPath   string
-}
-
-// loadCertAndCAFromPath parses the PEM certificates contained in the paths pointed by
-// the passed certPaths and return a certConfig with the client and CA certificates.
-func loadCertAndCAFromPath(pth certPaths) (*certConfig, error) {
-	ca := x509.NewCertPool()
-	caData, err := os.ReadFile(pth.caPath)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrBadCA, err)
-	}
-	ok := ca.AppendCertsFromPEM(caData)
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrBadCA, "cannot parse ca cert")
-	}
-
-	cfg := &certConfig{ca: ca}
-	if pth.certPath != "" && pth.keyPath != "" {
-		cert, err := tls.LoadX509KeyPair(pth.certPath, pth.keyPath)
-		if err != nil {
-			return nil, fmt.Errorf("%w: %s", ErrBadKeypair, err)
-		}
-		cfg.cert = cert
-	}
-	return cfg, nil
-}
-
 // certBytes holds the byte arrays for the cert, key, and ca used for OpenVPN
 // certificate authentication.
 type certBytes struct {
@@ -93,7 +60,7 @@ func loadCertAndCAFromBytes(crt certBytes) (*certConfig, error) {
 		return nil, fmt.Errorf("%w: %s", ErrBadCA, "cannot parse ca cert")
 	}
 	cfg := &certConfig{ca: ca}
-	if crt.cert != nil && crt.key != nil {
+	if len(crt.cert) != 0 && len(crt.key) != 0 {
 		cert, err := tls.X509KeyPair(crt.cert, crt.key)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s", ErrBadKeypair, err)
@@ -120,23 +87,11 @@ type certConfig struct {
 // from the paths specified in the passed Options object, and an error if it
 // could not be properly built.
 func newCertConfigFromOptions(o *config.OpenVPNOptions) (*certConfig, error) {
-	var cfg *certConfig
-	var err error
-
-	if o.ShouldLoadCertsFromPath() {
-		cfg, err = loadCertAndCAFromPath(certPaths{
-			certPath: o.CertPath,
-			keyPath:  o.KeyPath,
-			caPath:   o.CAPath,
-		})
-	} else {
-		cfg, err = loadCertAndCAFromBytes(certBytes{
-			cert: o.Cert,
-			key:  o.Key,
-			ca:   o.CA,
-		})
-	}
-	return cfg, err
+	return loadCertAndCAFromBytes(certBytes{
+		cert: o.Cert,
+		key:  o.Key,
+		ca:   o.CA,
+	})
 }
 
 // authority implements authorityPinner interface.

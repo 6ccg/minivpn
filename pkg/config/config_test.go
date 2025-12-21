@@ -58,16 +58,19 @@ remote 2.3.4.5 1194
 proto udp
 cipher AES-256-GCM
 auth SHA512
-ca ca.crt
-cert cert.pem
-key cert.pem
+<ca>
+dummy
+</ca>
+<cert>
+dummy
+</cert>
+<key>
+dummy
+</key>
 `
 
 func writeValidConfigFile(dir string) string {
 	cfg := fp.Join(dir, "config")
 	os.WriteFile(cfg, []byte(sampleConfigFile), 0600)
-	os.WriteFile(fp.Join(dir, "ca.crt"), []byte("dummy"), 0600)
-	os.WriteFile(fp.Join(dir, "cert.pem"), []byte("dummy"), 0600)
-	os.WriteFile(fp.Join(dir, "key.pem"), []byte("dummy"), 0600)
 	return cfg
 }

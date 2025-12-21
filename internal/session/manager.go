@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -97,54 +96,30 @@ func NewManager(config *config.Config) (*Manager, error) {
 	}
 	k.AddLocalKey(localKey)
 
-	// Need to load tls-auth from file or inline block.
+	// Control channel security options.
 	opts := config.OpenVPNOptions()
-	if len(opts.TLSAuthPath) != 0 || len(opts.TLSAuth) != 0 {
-		authData := opts.TLSAuth
-		if len(opts.TLSAuthPath) != 0 {
-			var err error
-			authData, err = os.ReadFile(opts.TLSAuthPath)
-			if err != nil {
-				return sessionManager, err
-			}
+	if len(opts.TLSAuth) != 0 {
+		direction := -1
+		if opts.KeyDirection != nil {
+			direction = *opts.KeyDirection
 		}
-
-		// TODO: provide ability to pass in key direction
-		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSAuth(authData, 1)
+		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSAuth(opts.TLSAuth, direction, opts.Auth)
 		if err != nil {
 			return sessionManager, err
 		}
 
 		// replay packet id starts at 1 but is offset here becuase the first packet is always a hard reset packet which is hardcoded to 1
 		sessionManager.localControlReplayPacketID = 2
-	} else if len(opts.TLSCryptPath) != 0 || len(opts.TLSCrypt) != 0 {
-		authData := opts.TLSCrypt
-		if len(opts.TLSCryptPath) != 0 {
-			var err error
-			authData, err = os.ReadFile(opts.TLSCryptPath)
-			if err != nil {
-				return sessionManager, err
-			}
-		}
-
-		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSCrypt(authData)
+	} else if len(opts.TLSCrypt) != 0 {
+		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSCrypt(opts.TLSCrypt)
 		if err != nil {
 			return sessionManager, err
 		}
 
 		// replay packet id starts at 1 but is offset here becuase the first packet is always a hard reset packet which is hardcoded to 1
 		sessionManager.localControlReplayPacketID = 2
-	} else if len(opts.TLSCryptV2Path) != 0 || len(opts.TLSCryptV2) != 0 {
-		authData := opts.TLSCryptV2
-		if len(opts.TLSCryptV2Path) != 0 {
-			var err error
-			authData, err = os.ReadFile(opts.TLSCryptV2Path)
-			if err != nil {
-				return sessionManager, err
-			}
-		}
-
-		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSCryptV2(authData)
+	} else if len(opts.TLSCryptV2) != 0 {
+		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSCryptV2(opts.TLSCryptV2)
 		if err != nil {
 			return sessionManager, err
 		}

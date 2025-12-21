@@ -36,8 +36,18 @@ func decodeEncryptedPayloadAEAD(log model.Logger, buf []byte, session *session.M
 	if len(state.hmacKeyRemote) < 8 {
 		return &encryptedData{}, ErrBadRemoteHMAC
 	}
-	remoteHMAC := state.hmacKeyRemote[:8]
+
+	// Extract and validate packet_id for replay protection
+	// This is done BEFORE decryption as the packet_id is in the authenticated header
 	packet_id := buf[:4]
+	packetID := model.PacketID(binary.BigEndian.Uint32(packet_id))
+
+	// Check for replay attack using sliding window
+	if err := state.CheckReplay(packetID); err != nil {
+		return &encryptedData{}, err
+	}
+
+	remoteHMAC := state.hmacKeyRemote[:8]
 
 	headers := &bytes.Buffer{}
 	headers.WriteByte(opcodeAndKeyHeader(session))
@@ -118,11 +128,10 @@ func maybeDecompress(b []byte, st *dataChannelState, opt *config.OpenVPNOptions)
 	var compr byte // compression type
 	var payload []byte
 
-	// TODO(ainghazal): have two different decompress implementations
-	// instead of this switch
-
 	switch st.dataCipher.isAEAD() {
 	case true:
+		// AEAD mode: replay check was already done in decodeEncryptedPayloadAEAD
+		// The decrypted payload does not contain packet_id
 		switch opt.Compress {
 		case config.CompressionStub, config.CompressionLZONo:
 			// these are deprecated in openvpn 2.5.x
@@ -133,15 +142,16 @@ func maybeDecompress(b []byte, st *dataChannelState, opt *config.OpenVPNOptions)
 			payload = b[:]
 		}
 	default: // non-aead
+		// Non-AEAD mode: decrypted payload contains packet_id at the beginning
+		if len(b) < 4 {
+			return []byte{}, fmt.Errorf("%w: payload too short for packet_id", ErrBadInput)
+		}
 		remotePacketID := model.PacketID(binary.BigEndian.Uint32(b[:4]))
-		lastKnownRemote, err := st.RemotePacketID()
-		if err != nil {
-			return payload, err
+
+		// Check for replay attack using sliding window
+		if err := st.CheckReplay(remotePacketID); err != nil {
+			return []byte{}, err
 		}
-		if remotePacketID <= lastKnownRemote {
-			return []byte{}, ErrReplayAttack
-		}
-		st.SetRemotePacketID(remotePacketID)
 
 		switch opt.Compress {
 		case config.CompressionStub, config.CompressionLZONo:

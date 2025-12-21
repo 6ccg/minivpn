@@ -9,6 +9,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/ooni/minivpn/internal/runtimex"
@@ -40,11 +41,25 @@ func (p Proto) String() string {
 	return string(p)
 }
 
-// ProtoTCP is used for vpn in TCP mode.
-const ProtoTCP = Proto("tcp")
+const (
+	// ProtoTCP is used for vpn in TCP mode (dual-stack).
+	ProtoTCP = Proto("tcp")
 
-// ProtoUDP is used for vpn in UDP mode.
-const ProtoUDP = Proto("udp")
+	// ProtoTCP4 is used for vpn in TCP mode, forcing IPv4.
+	ProtoTCP4 = Proto("tcp4")
+
+	// ProtoTCP6 is used for vpn in TCP mode, forcing IPv6.
+	ProtoTCP6 = Proto("tcp6")
+
+	// ProtoUDP is used for vpn in UDP mode (dual-stack).
+	ProtoUDP = Proto("udp")
+
+	// ProtoUDP4 is used for vpn in UDP mode, forcing IPv4.
+	ProtoUDP4 = Proto("udp4")
+
+	// ProtoUDP6 is used for vpn in UDP mode, forcing IPv6.
+	ProtoUDP6 = Proto("udp6")
+)
 
 // ErrBadConfig is the generic error returned for invalid config files
 var ErrBadConfig = errors.New("openvpn: bad config")
@@ -55,7 +70,6 @@ var SupportedCiphers = []string{
 	"AES-192-CBC",
 	"AES-256-CBC",
 	"AES-128-GCM",
-	"AES-192-GCM",
 	"AES-256-GCM",
 }
 
@@ -70,32 +84,33 @@ var SupportedAuth = []string{
 // different modules that need it.
 type OpenVPNOptions struct {
 	// These options have the same name of OpenVPN options referenced in the official documentation:
-	Remote         string
-	Port           string
-	Proto          Proto
-	Username       string
-	Password       string
-	CAPath         string
-	CertPath       string
-	KeyPath        string
-	TLSAuthPath    string
-	TLSCryptPath   string
-	TLSCryptV2Path string
-	CA             []byte
-	Cert           []byte
-	Key            []byte
-	TLSAuth        []byte
-	TLSCrypt       []byte
-	TLSCryptV2     []byte
-	Cipher         string
-	Auth           string
-	TLSMaxVer      string
+	Remote     string
+	Port       string
+	Proto      Proto
+	Username   string
+	Password   string
+	CA         []byte
+	Cert       []byte
+	Key        []byte
+	TLSAuth    []byte
+	TLSCrypt   []byte
+	TLSCryptV2 []byte
+	Cipher     string
+	Auth       string
+	TLSMaxVer  string
 
 	// Below are options that do not conform strictly to the OpenVPN configuration format, but still can
 	// be understood by us in a configuration file:
 
 	Compress   Compression
 	ProxyOBFS4 string
+
+	// KeyDirection is the tls-auth key-direction. When unset, OpenVPN operates
+	// in bidirectional mode.
+	KeyDirection *int
+
+	// AuthUserPass indicates that auth-user-pass was present in the config.
+	AuthUserPass bool
 }
 
 // ReadConfigFile expects a string with a path to a valid config file,
@@ -110,22 +125,18 @@ func ReadConfigFile(filePath string) (*OpenVPNOptions, error) {
 	return getOptionsFromLines(lines, dir)
 }
 
-// ShouldLoadCertsFromPath returns true when the options object is configured to load
-// certificates from paths; false when we have inline certificates.
-func (o *OpenVPNOptions) ShouldLoadCertsFromPath() bool {
-	return o.CertPath != "" && o.KeyPath != "" && o.CAPath != ""
-}
-
 // HasAuthInfo returns true if:
-// - we have paths for cert, key and ca; or
 // - we have inline byte arrays for cert, key and ca; or
-// - we have username + password info.
+// - we have username + password + ca info.
 // TODO(ainghazal): add sanity checks for valid/existing credentials.
 func (o *OpenVPNOptions) HasAuthInfo() bool {
-	if o.CertPath != "" && o.KeyPath != "" && o.CAPath != "" {
-		return true
+	if len(o.CA) == 0 {
+		return false
 	}
-	if len(o.Cert) != 0 && len(o.Key) != 0 && len(o.CA) != 0 {
+	if o.AuthUserPass {
+		return o.Username != "" && o.Password != ""
+	}
+	if len(o.Cert) != 0 && len(o.Key) != 0 {
 		return true
 	}
 	if o.Username != "" && o.Password != "" {
@@ -135,7 +146,7 @@ func (o *OpenVPNOptions) HasAuthInfo() bool {
 }
 
 // clientOptions is the options line we're passing to the OpenVPN server during the handshake.
-const clientOptions = "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto %sv4,cipher %s,auth %s,keysize %s,key-method 2,tls-client"
+const clientOptions = "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto %s,cipher %s,auth %s,keysize %s,key-method 2,tls-client"
 
 // ServerOptionsString produces a comma-separated representation of the options, in the same
 // order and format that the OpenVPN server expects from us.
@@ -145,9 +156,18 @@ func (o *OpenVPNOptions) ServerOptionsString() string {
 	}
 	// TODO(ainghazal): this line of code crashes if the ciphers are not well formed
 	keysize := strings.Split(o.Cipher, "-")[1]
-	proto := strings.ToUpper(ProtoUDP.String())
-	if o.Proto == ProtoTCP {
-		proto = strings.ToUpper(ProtoTCP.String())
+	proto := "UDPv4"
+	switch o.Proto {
+	case ProtoTCP, ProtoTCP4:
+		proto = "TCPv4"
+	case ProtoTCP6:
+		proto = "TCPv6"
+	case ProtoUDP, ProtoUDP4:
+		proto = "UDPv4"
+	case ProtoUDP6:
+		proto = "UDPv6"
+	default:
+		proto = strings.ToUpper(o.Proto.String())
 	}
 	s := fmt.Sprintf(clientOptions, proto, o.Cipher, o.Auth, keysize)
 	if o.Compress == CompressionStub {
@@ -164,12 +184,22 @@ func parseProto(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
 	if len(p) != 1 {
 		return o, fmt.Errorf("%w: %s", ErrBadConfig, "proto needs one arg")
 	}
-	m := p[0]
+	m := strings.ToLower(p[0])
 	switch m {
-	case ProtoUDP.String():
+	case "udp":
 		o.Proto = ProtoUDP
-	case ProtoTCP.String():
+	case "udp4":
+		o.Proto = ProtoUDP4
+	case "udp6":
+		o.Proto = ProtoUDP6
+	case "tcp", "tcp-client":
 		o.Proto = ProtoTCP
+	case "tcp4", "tcp4-client":
+		o.Proto = ProtoTCP4
+	case "tcp6", "tcp6-client":
+		o.Proto = ProtoTCP6
+	case "tcp-server", "tcp4-server", "tcp6-server":
+		return o, fmt.Errorf("%w: unsupported proto (server mode): %s", ErrBadConfig, m)
 	default:
 		return o, fmt.Errorf("%w: bad proto: %s", ErrBadConfig, m)
 
@@ -209,123 +239,106 @@ func parseAuth(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
 	return o, nil
 }
 
-func parseCA(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
-	e := fmt.Errorf("%w: %s", ErrBadConfig, "ca expects a valid file")
+func setKeyDirection(o *OpenVPNOptions, dir int) error {
+	if dir != 0 && dir != 1 {
+		return fmt.Errorf("%w: key-direction must be 0 or 1", ErrBadConfig)
+	}
+	if o.KeyDirection != nil && *o.KeyDirection != dir {
+		return fmt.Errorf("%w: conflicting key-direction values", ErrBadConfig)
+	}
+	if o.KeyDirection == nil {
+		o.KeyDirection = new(int)
+	}
+	*o.KeyDirection = dir
+	return nil
+}
+
+func parseKeyDirection(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
 	if len(p) != 1 {
-		return o, e
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "key-direction expects one arg")
 	}
-	ca := toAbs(p[0], basedir)
-	if sub, _ := isSubdir(basedir, ca); !sub {
-		return o, fmt.Errorf("%w: %s", ErrBadConfig, "ca must be below config path")
+	dir, err := strconv.Atoi(p[0])
+	if err != nil {
+		return o, fmt.Errorf("%w: key-direction must be 0 or 1", ErrBadConfig)
 	}
-	if !existsFile(ca) {
-		return o, e
+	if err := setKeyDirection(o, dir); err != nil {
+		return o, err
 	}
-	o.CAPath = ca
 	return o, nil
+}
+
+func parseCA(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "ca expects one arg")
+	}
+	return o, fmt.Errorf("%w: %s", ErrBadConfig, "ca file paths are not supported; embed <ca>...</ca> in the .ovpn file")
 }
 
 func parseCert(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
-	e := fmt.Errorf("%w: %s", ErrBadConfig, "cert expects a valid file")
 	if len(p) != 1 {
-		return o, e
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "cert expects one arg")
 	}
-	cert := toAbs(p[0], basedir)
-	if sub, _ := isSubdir(basedir, cert); !sub {
-		return o, fmt.Errorf("%w: %s", ErrBadConfig, "cert must be below config path")
-	}
-	if !existsFile(cert) {
-		return o, e
-	}
-	o.CertPath = cert
-	return o, nil
+	return o, fmt.Errorf("%w: %s", ErrBadConfig, "cert file paths are not supported; embed <cert>...</cert> in the .ovpn file")
 }
 
 func parseKey(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
-	e := fmt.Errorf("%w: %s", ErrBadConfig, "key expects a valid file")
 	if len(p) != 1 {
-		return o, e
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "key expects one arg")
 	}
-	key := toAbs(p[0], basedir)
-	if sub, _ := isSubdir(basedir, key); !sub {
-		return o, fmt.Errorf("%w: %s", ErrBadConfig, "key must be below config path")
-	}
-	if !existsFile(key) {
-		return o, e
-	}
-	o.KeyPath = key
-	return o, nil
+	return o, fmt.Errorf("%w: %s", ErrBadConfig, "key file paths are not supported; embed <key>...</key> in the .ovpn file")
 }
 
 func parseTLSAuth(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
-	e := fmt.Errorf("%w: %s", ErrBadConfig, "tls-auth expects a valid file")
-	if len(p) != 1 {
-		return o, e
+	if len(p) == 0 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-auth expects at least one arg")
 	}
-	tlsAuth := toAbs(p[0], basedir)
-	if sub, _ := isSubdir(basedir, tlsAuth); !sub {
-		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-auth must be below config path")
+	if len(p) == 1 {
+		if strings.EqualFold(p[0], "inline") {
+			return o, nil
+		}
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-auth file paths are not supported; embed <tls-auth>...</tls-auth> in the .ovpn file")
 	}
-	if !existsFile(tlsAuth) {
-		return o, e
+	if len(p) == 2 {
+		if !strings.EqualFold(p[0], "inline") {
+			return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-auth file paths are not supported; use tls-auth inline <direction>")
+		}
+		dir, err := strconv.Atoi(p[1])
+		if err != nil {
+			return o, fmt.Errorf("%w: tls-auth direction must be 0 or 1", ErrBadConfig)
+		}
+		if err := setKeyDirection(o, dir); err != nil {
+			return o, err
+		}
+		return o, nil
 	}
-	o.TLSAuthPath = tlsAuth
-	return o, nil
+	return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-auth expects at most two args")
 }
 
 func parseTLSCrypt(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
-	e := fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt expects a valid file")
 	if len(p) != 1 {
-		return o, e
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt expects one arg")
 	}
-	path := toAbs(p[0], basedir)
-	if sub, _ := isSubdir(basedir, path); !sub {
-		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt must be below config path")
-	}
-	if !existsFile(path) {
-		return o, e
-	}
-	o.TLSCryptPath = path
-	return o, nil
+	return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt file paths are not supported; embed <tls-crypt>...</tls-crypt> in the .ovpn file")
 }
 
 func parseTLSCryptV2(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
-	e := fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt-v2 expects a valid file")
 	if len(p) != 1 {
-		return o, e
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt-v2 expects one arg")
 	}
-	path := toAbs(p[0], basedir)
-	if sub, _ := isSubdir(basedir, path); !sub {
-		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt-v2 must be below config path")
-	}
-	if !existsFile(path) {
-		return o, e
-	}
-	o.TLSCryptV2Path = path
-	return o, nil
+	return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-crypt-v2 file paths are not supported; embed <tls-crypt-v2>...</tls-crypt-v2> in the .ovpn file")
 }
 
-// parseAuthUser reads credentials from a given file, according to the openvpn
-// format (user and pass on a line each). To avoid path traversal / LFI, the
-// credentials file is expected to be in a subdirectory of the base dir.
+// parseAuthUser parses the auth-user-pass directive.
+//
+// We explicitly reject external credential files: credentials must be provided
+// via the <auth-user-pass>...</auth-user-pass> inline block or via the caller
+// configuration (e.g., Clash username/password).
 func parseAuthUser(p []string, o *OpenVPNOptions, basedir string) (*OpenVPNOptions, error) {
-	e := fmt.Errorf("%w: %s", ErrBadConfig, "auth-user-pass expects a valid file")
-	if len(p) != 1 {
-		return o, e
+	o.AuthUserPass = true
+	if len(p) == 0 {
+		return o, nil
 	}
-	auth := toAbs(p[0], basedir)
-	if sub, _ := isSubdir(basedir, auth); !sub {
-		return o, fmt.Errorf("%w: %s", ErrBadConfig, "auth must be below config path")
-	}
-	if !existsFile(auth) {
-		return o, e
-	}
-	creds, err := getCredentialsFromFile(auth)
-	if err != nil {
-		return o, err
-	}
-	o.Username, o.Password = creds[0], creds[1]
-	return o, nil
+	return o, fmt.Errorf("%w: %s", ErrBadConfig, "auth-user-pass file paths are not supported; embed <auth-user-pass>...</auth-user-pass> in the .ovpn file or configure username/password")
 }
 
 func parseCompress(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
@@ -378,6 +391,7 @@ var pMap = map[string]interface{}{
 	"remote":          parseRemote,
 	"cipher":          parseCipher,
 	"auth":            parseAuth,
+	"key-direction":   parseKeyDirection,
 	"compress":        parseCompress,
 	"comp-lzo":        parseCompLZO,
 	"proxy-obfs4":     parseProxyOBFS4,
@@ -396,7 +410,7 @@ var pMapDir = map[string]interface{}{
 
 func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (*OpenVPNOptions, error) {
 	switch key {
-	case "proto", "remote", "cipher", "auth", "compress", "comp-lzo", "tls-version-max", "proxy-obfs4":
+	case "proto", "remote", "cipher", "auth", "key-direction", "compress", "comp-lzo", "tls-version-max", "proxy-obfs4":
 		fn := pMap[key].(func([]string, *OpenVPNOptions) (*OpenVPNOptions, error))
 		if updatedOpt, e := fn(p, opt); e != nil {
 			return updatedOpt, e
@@ -417,28 +431,22 @@ func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (
 // format. The config file supports inline file inclusion for <ca>, <cert> and <key>.
 func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 	opt := &OpenVPNOptions{
-		Remote:         "",
-		Port:           "",
-		Proto:          ProtoTCP,
-		Username:       "",
-		Password:       "",
-		CAPath:         "",
-		CertPath:       "",
-		KeyPath:        "",
-		TLSAuthPath:    "",
-		TLSCryptPath:   "",
-		TLSCryptV2Path: "",
-		CA:             []byte{},
-		Cert:           []byte{},
-		Key:            []byte{},
-		TLSAuth:        []byte{},
-		TLSCrypt:       []byte{},
-		TLSCryptV2:     []byte{},
-		Cipher:         "",
-		Auth:           "",
-		TLSMaxVer:      "",
-		Compress:       CompressionEmpty,
-		ProxyOBFS4:     "",
+		Remote:     "",
+		Port:       "",
+		Proto:      ProtoTCP,
+		Username:   "",
+		Password:   "",
+		CA:         []byte{},
+		Cert:       []byte{},
+		Key:        []byte{},
+		TLSAuth:    []byte{},
+		TLSCrypt:   []byte{},
+		TLSCryptV2: []byte{},
+		Cipher:     "",
+		Auth:       "",
+		TLSMaxVer:  "",
+		Compress:   CompressionEmpty,
+		ProxyOBFS4: "",
 	}
 
 	// tag and inlineBuf are used to parse inline files.
@@ -450,10 +458,10 @@ func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 	inlineBuf := new(bytes.Buffer)
 
 	for lineno, l := range lines {
-		if strings.HasPrefix(l, "#") {
+		l = strings.TrimSpace(l)
+		if l == "" {
 			continue
 		}
-		l = strings.TrimSpace(l)
 
 		// inline certs
 		if isClosingTag(l) {
@@ -481,8 +489,13 @@ func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 			continue
 		}
 
+		// comments
+		if strings.HasPrefix(l, "#") || strings.HasPrefix(l, ";") {
+			continue
+		}
+
 		// parse parts in the same line
-		p := strings.Split(l, " ")
+		p := strings.Fields(l)
 		if len(p) == 0 {
 			continue
 		}
@@ -506,7 +519,7 @@ func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 
 func isOpeningTag(key string) bool {
 	switch key {
-	case "<ca>", "<cert>", "<key>", "<tls-auth>", "<tls-crypt>", "<tls-crypt-v2>":
+	case "<ca>", "<cert>", "<key>", "<tls-auth>", "<tls-crypt>", "<tls-crypt-v2>", "<auth-user-pass>":
 		return true
 	default:
 		return false
@@ -515,7 +528,7 @@ func isOpeningTag(key string) bool {
 
 func isClosingTag(key string) bool {
 	switch key {
-	case "</ca>", "</cert>", "</key>", "</tls-auth>", "</tls-crypt>", "</tls-crypt-v2>":
+	case "</ca>", "</cert>", "</key>", "</tls-auth>", "</tls-crypt>", "</tls-crypt-v2>", "</auth-user-pass>":
 		return true
 	default:
 		return false
@@ -536,6 +549,8 @@ func parseTag(tag string) string {
 		return "tls-crypt"
 	case "<tls-crypt-v2>", "</tls-crypt-v2>":
 		return "tls-crypt-v2"
+	case "<auth-user-pass>", "</auth-user-pass>":
+		return "auth-user-pass"
 	default:
 		return ""
 	}
@@ -560,6 +575,17 @@ func parseInlineTag(o *OpenVPNOptions, tag string, buf *bytes.Buffer) error {
 		o.TLSCrypt = b
 	case "tls-crypt-v2":
 		o.TLSCryptV2 = b
+	case "auth-user-pass":
+		lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+		if len(lines) < 2 {
+			return fmt.Errorf("%w: auth-user-pass expects at least two lines", ErrBadConfig)
+		}
+		o.Username = strings.TrimSpace(lines[0])
+		o.Password = strings.TrimSpace(lines[1])
+		if o.Username == "" || o.Password == "" {
+			return fmt.Errorf("%w: auth-user-pass expects non-empty username and password", ErrBadConfig)
+		}
+		o.AuthUserPass = true
 	default:
 		return fmt.Errorf("%w: unknown tag: %s", ErrBadConfig, tag)
 	}

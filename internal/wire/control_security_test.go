@@ -2,6 +2,10 @@ package wire
 
 import (
 	"bytes"
+	"crypto"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/binary"
 	"encoding/hex"
 	"testing"
@@ -74,10 +78,52 @@ func TestGeneratePacketHMAC(t *testing.T) {
 		replay := replayProtectionBytes(pack)
 		header := headerBytes(pack)
 		msg, _ := controlMessageBytes(pack)
-		hmac := GenerateTLSAuthDigest(&k1, header, replay, msg)
+		hmac := GenerateTLSAuthDigest(crypto.SHA1, &k1, header, replay, msg)
 
-		if !bytes.Equal(hmac[:], want) {
-			t.Errorf("incorrect hmac generated got=%x want=%x", hmac[:], want)
+		if !bytes.Equal(hmac, want) {
+			t.Errorf("incorrect hmac generated got=%x want=%x", hmac, want)
+		}
+	})
+
+	t.Run("sha256 uses digest-size key prefix", func(t *testing.T) {
+		replay := replayProtectionBytes(pack)
+		header := headerBytes(pack)
+		msg, _ := controlMessageBytes(pack)
+
+		got := GenerateTLSAuthDigest(crypto.SHA256, &k1, header, replay, msg)
+		if len(got) != sha256.Size {
+			t.Fatalf("unexpected digest length: got=%d want=%d", len(got), sha256.Size)
+		}
+
+		h := hmac.New(sha256.New, k1[:sha256.Size])
+		h.Write(replay)
+		h.Write(header)
+		h.Write(msg)
+		want := h.Sum(nil)
+
+		if !bytes.Equal(got, want) {
+			t.Errorf("incorrect hmac generated got=%x want=%x", got, want)
+		}
+	})
+
+	t.Run("sha512 uses digest-size key prefix", func(t *testing.T) {
+		replay := replayProtectionBytes(pack)
+		header := headerBytes(pack)
+		msg, _ := controlMessageBytes(pack)
+
+		got := GenerateTLSAuthDigest(crypto.SHA512, &k1, header, replay, msg)
+		if len(got) != sha512.Size {
+			t.Fatalf("unexpected digest length: got=%d want=%d", len(got), sha512.Size)
+		}
+
+		h := hmac.New(sha512.New, k1[:sha512.Size])
+		h.Write(replay)
+		h.Write(header)
+		h.Write(msg)
+		want := h.Sum(nil)
+
+		if !bytes.Equal(got, want) {
+			t.Errorf("incorrect hmac generated got=%x want=%x", got, want)
 		}
 	})
 }

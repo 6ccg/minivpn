@@ -12,11 +12,10 @@ import (
 )
 
 func Test_decodeEncryptedPayloadAEAD(t *testing.T) {
-	state := makeTestingStateAEAD()
-	goodEncryptedPayload, _ := hex.DecodeString("00000000b3653a842f2b8a148de26375218fb01d31278ff328ff2fc65c4dbf9eb8e67766")
-	goodDecodeIV, _ := hex.DecodeString("000000006868686868686868")
+	goodEncryptedPayload, _ := hex.DecodeString("00000001b3653a842f2b8a148de26375218fb01d31278ff328ff2fc65c4dbf9eb8e67766")
+	goodDecodeIV, _ := hex.DecodeString("000000016868686868686868")
 	goodDecodeCipherText, _ := hex.DecodeString("31278ff328ff2fc65c4dbf9eb8e67766b3653a842f2b8a148de26375218fb01d")
-	goodDecodeAEAD, _ := hex.DecodeString("4800000000000000")
+	goodDecodeAEAD, _ := hex.DecodeString("4800000000000001")
 
 	type args struct {
 		buf     []byte
@@ -34,7 +33,7 @@ func Test_decodeEncryptedPayloadAEAD(t *testing.T) {
 			args{
 				[]byte{},
 				makeTestingSession(),
-				state,
+				makeTestingStateAEAD(),
 			},
 			&encryptedData{},
 			ErrTooShort,
@@ -44,7 +43,7 @@ func Test_decodeEncryptedPayloadAEAD(t *testing.T) {
 			args{
 				bytes.Repeat([]byte{0xff}, 19),
 				makeTestingSession(),
-				state,
+				makeTestingStateAEAD(),
 			},
 			&encryptedData{},
 			ErrTooShort,
@@ -54,7 +53,7 @@ func Test_decodeEncryptedPayloadAEAD(t *testing.T) {
 			args{
 				goodEncryptedPayload,
 				makeTestingSession(),
-				state,
+				makeTestingStateAEAD(),
 			},
 			&encryptedData{
 				iv:         goodDecodeIV,
@@ -62,6 +61,20 @@ func Test_decodeEncryptedPayloadAEAD(t *testing.T) {
 				aead:       goodDecodeAEAD,
 			},
 			nil,
+		},
+		{
+			"packet_id zero should be rejected",
+			args{
+				// packet_id = 0 is invalid
+				func() []byte {
+					p, _ := hex.DecodeString("00000000b3653a842f2b8a148de26375218fb01d31278ff328ff2fc65c4dbf9eb8e67766")
+					return p
+				}(),
+				makeTestingSession(),
+				makeTestingStateAEAD(),
+			},
+			&encryptedData{},
+			ErrReplayAttack,
 		},
 	}
 	for _, tt := range tests {

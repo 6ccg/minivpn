@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
+	"os"
 	"testing"
 
 	"github.com/ooni/minivpn/internal/model"
@@ -22,12 +23,18 @@ func makeTestingSession() *session.Manager {
 
 func makeTestingOptions(t *testing.T, cipher, auth string) *config.OpenVPNOptions {
 	crt, _ := vpntest.WriteTestingCerts(t.TempDir())
+	certBytes, err := os.ReadFile(crt.Cert)
+	runtimex.PanicOnError(err, "could not read testing cert")
+	keyBytes, err := os.ReadFile(crt.Key)
+	runtimex.PanicOnError(err, "could not read testing key")
+	caBytes, err := os.ReadFile(crt.CA)
+	runtimex.PanicOnError(err, "could not read testing ca")
 	opt := &config.OpenVPNOptions{
-		Cipher:   cipher,
-		Auth:     auth,
-		CertPath: crt.Cert,
-		KeyPath:  crt.Key,
-		CAPath:   crt.CA,
+		Cipher: cipher,
+		Auth:   auth,
+		Cert:   certBytes,
+		Key:    keyBytes,
+		CA:     caBytes,
 	}
 	return opt
 }

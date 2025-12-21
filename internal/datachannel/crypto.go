@@ -161,7 +161,7 @@ func (a *dataCipherAES) decrypt(key []byte, data *encryptedData) ([]byte, error)
 
 		plaintext, err := aesGCM.Open(nil, data.iv, data.ciphertext, data.aead)
 		if err != nil {
-			log.Println("gdm decryption failed:", err.Error())
+			log.Println("gcm decryption failed:", err.Error())
 			return nil, err
 		}
 		return plaintext, nil

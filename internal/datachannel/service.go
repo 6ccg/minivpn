@@ -203,6 +203,20 @@ func (ws *workersState) keyWorker(firstKeyReady chan<- any) {
 			err := ws.dataChannel.setupKeys(key)
 			if err != nil {
 				ws.logger.Warnf("error on key derivation: %v", err)
+
+				// Distinguish between initial key derivation and key rotation.
+				// Similar to OpenVPN's handling: fatal error on initial, recoverable on rotation.
+				if ws.sessionManager.NegotiationState() < model.S_GENERATED_KEYS {
+					// Initial key derivation failed - fatal error, notify upper layer
+					ws.sessionManager.SetNegotiationState(model.S_ERROR)
+					select {
+					case ws.sessionManager.Failure <- fmt.Errorf("key derivation failed: %w", err):
+					default:
+					}
+					return
+				}
+				// Key rotation failed - old key still usable, wait for next rotation attempt
+				ws.logger.Warnf("key rotation failed, continuing with current key")
 				continue
 			}
 			ws.sessionManager.SetNegotiationState(model.S_GENERATED_KEYS)
