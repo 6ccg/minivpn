@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/ooni/minivpn/internal/bytespool"
 	"github.com/ooni/minivpn/internal/bytesx"
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/session"
@@ -91,6 +92,9 @@ type workersState struct {
 
 	// how many times have we sent the initial hardReset packet
 	hardResetCount int
+
+	// hardResetTimeout is the current retry timeout (exponential backoff)
+	hardResetTimeout time.Duration
 
 	// hardResetTicker is a channel to retry the initial send of hard reset packet.
 	hardResetTicker *time.Ticker
@@ -227,14 +231,23 @@ func (ws *workersState) startHardReset() error {
 	// increment the hard reset counter for retries
 	ws.hardResetCount++
 
+	// initialize timeout on first attempt (exponential backoff like OpenVPN)
+	if ws.hardResetTimeout == 0 {
+		ws.hardResetTimeout = 2 * time.Second
+	}
+
 	// reset the state to become initial again.
 	ws.sessionManager.SetNegotiationState(model.S_PRE_START)
+
+	// Reset the control channel replay filter for the new session.
+	ws.sessionManager.ResetControlReplay()
 
 	// emit a CONTROL_HARD_RESET_CLIENT_V2 pkt
 	packet := ws.sessionManager.NewHardResetPacket()
 	ws.logger.Debugf(
-		"packetmuxer: startHardReset count=%d opcode=%s replay=%d ts=%d",
+		"packetmuxer: startHardReset count=%d timeout=%v opcode=%s replay=%d ts=%d",
 		ws.hardResetCount,
+		ws.hardResetTimeout,
 		packet.Opcode,
 		packet.ReplayPacketID,
 		packet.Timestamp,
@@ -243,13 +256,18 @@ func (ws *workersState) startHardReset() error {
 		return err
 	}
 
-	// resend if not received the server's reply in 2 seconds.
-	ws.hardResetTicker.Reset(time.Second * 2)
+	// resend with exponential backoff if not received the server's reply
+	ws.hardResetTicker.Reset(ws.hardResetTimeout)
+	ws.hardResetTimeout *= 2 // exponential backoff
+	if ws.hardResetTimeout > 64*time.Second {
+		ws.hardResetTimeout = 64 * time.Second // cap at 64 seconds
+	}
 
 	return nil
 }
 
 // handleRawPacket is the code invoked to handle a raw packet.
+// The rawPacket is from the bytespool and will be released when the packet is Free()'d.
 func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 	// Debug: full wire dump of incoming packet
 	if debugWireEnabled() {
@@ -287,8 +305,17 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 			len(rawPacket),
 			bytesx.HexPrefix(rawPacket, 32),
 		)
+		// Release the buffer back to pool on parse error
+		bytespool.Default.Put(rawPacket)
 		return nil // keep running
 	}
+
+	// Set release callback to return rawPacket to pool when Free() is called.
+	// The packet's Payload is a slice of rawPacket, so we must keep rawPacket
+	// alive until the packet is fully processed.
+	packet.SetReleaseFunc(func() {
+		bytespool.Default.Put(rawPacket)
+	})
 	ws.logger.Debugf(
 		"packetmuxer: parsed opcode=%s key=%d peer=%x id=%d replay=%d ts=%d acks=%v payload=%d head=%s",
 		packet.Opcode,
@@ -309,6 +336,27 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 			ws.sessionManager.MaybeSetPeerID(peerID)
 		}
 	}
+
+	// Replay protection check for control channel packets.
+	// This validates the ReplayPacketID and Timestamp fields to prevent replay attacks.
+	// Only effective when control channel security (tls-auth/tls-crypt) is enabled.
+	if packet.IsControl() || packet.Opcode == model.P_ACK_V1 {
+		if err := ws.sessionManager.CheckControlReplay(packet.ReplayPacketID, packet.Timestamp); err != nil {
+			ws.logger.Warnf(
+				"packetmuxer: control channel replay attack detected: %s (replay=%d ts=%d)",
+				err.Error(),
+				packet.ReplayPacketID,
+				packet.Timestamp,
+			)
+			packet.Free() // release buffer back to pool
+			return nil    // drop the packet silently
+		}
+	}
+
+	// Update last packet time for keepalive tracking.
+	// This applies to all valid packets (control and data).
+	// Reference: OpenVPN 2.5 src/openvpn/forward.c - any incoming packet resets the timer.
+	ws.sessionManager.UpdateLastPacketTime()
 
 	// handle the case where we're performing a HARD_RESET
 	if ws.sessionManager.NegotiationState() == model.S_PRE_START &&
@@ -352,9 +400,11 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 					packet.PeerID,
 					len(rawPacket),
 				)
+				packet.Free() // release buffer back to pool
 				return nil
 			}
 			ws.logger.Warnf("malformed input")
+			packet.Free() // release buffer back to pool
 			return errors.New("malformed input")
 		}
 		select {
@@ -371,6 +421,10 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 func (ws *workersState) finishThreeWayHandshake(packet *model.Packet) error {
 	// register the server's session (note: the PoV is the server's one)
 	ws.sessionManager.SetRemoteSessionID(packet.LocalSessionID)
+
+	// reset exponential backoff state for next connection attempt
+	ws.hardResetTimeout = 0
+	ws.hardResetCount = 0
 
 	// advance the state
 	ws.sessionManager.SetNegotiationState(model.S_START)

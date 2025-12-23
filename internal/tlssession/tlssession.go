@@ -12,7 +12,7 @@ import (
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/session"
 	"github.com/ooni/minivpn/internal/workers"
-	"github.com/ooni/minivpn/pkg/config"
+	vpnconfig "github.com/ooni/minivpn/pkg/config"
 
 	tls "github.com/refraction-networking/utls"
 )
@@ -53,7 +53,7 @@ type Service struct {
 //
 // [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
 func (svc *Service) StartWorkers(
-	config *config.Config,
+	config *vpnconfig.Config,
 	workersManager *workers.Manager,
 	sessionManager *session.Manager,
 ) {
@@ -74,7 +74,7 @@ func (svc *Service) StartWorkers(
 type workersState struct {
 	logger         model.Logger
 	notifyTLS      <-chan *model.Notification
-	options        *config.OpenVPNOptions
+	options        *vpnconfig.OpenVPNOptions
 	tlsRecordDown  chan<- []byte
 	tlsRecordUp    <-chan []byte
 	keyUp          chan<- *session.DataChannelKey
@@ -143,8 +143,14 @@ func (ws *workersState) tlsAuth() error {
 	}
 
 	// run the real algorithm in a background goroutine
-	errorch := make(chan error)
-	go ws.doTLSAuth(conn, tlsConf, errorch)
+	// Use buffered channel to prevent goroutine leak if tlsAuth returns
+	// due to shutdown before doTLSAuth completes its send.
+	errorch := make(chan error, 1)
+	ws.workersManager.TrackGoroutine()
+	go func() {
+		defer ws.workersManager.UntrackGoroutine()
+		ws.doTLSAuth(conn, tlsConf, errorch)
+	}()
 
 	select {
 	case err := <-errorch:
@@ -207,10 +213,14 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 	// Send PUSH_REQUEST and keep retrying until we receive PUSH_REPLY.
 	// The reference OpenVPN client periodically resends PUSH_REQUEST, because
 	// some servers defer the push-reply until the connection is fully ready.
-	const (
-		pushRequestInterval = 5 * time.Second
-		pushReplyTimeout    = 55 * time.Second
-	)
+	// Uses hand-window (default 60s) for total timeout and 5s retry interval
+	// matching OpenVPN's PUSH_REQUEST_INTERVAL constant.
+	pushRequestInterval := time.Duration(vpnconfig.PushRequestInterval) * time.Second
+	handshakeWindow := ws.options.HandshakeWindow
+	if handshakeWindow <= 0 {
+		handshakeWindow = vpnconfig.DefaultHandshakeWindow
+	}
+	pushReplyTimeout := time.Duration(handshakeWindow) * time.Second
 
 	if err := ws.sendPushRequestMessage(tlsConn); err != nil {
 		errorch <- err
@@ -219,7 +229,9 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 
 	stopPushRequests := make(chan struct{})
 	pushTimeout := make(chan error, 1)
+	ws.workersManager.TrackGoroutine()
 	go func() {
+		defer ws.workersManager.UntrackGoroutine()
 		ticker := time.NewTicker(pushRequestInterval)
 		defer ticker.Stop()
 
@@ -240,6 +252,9 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 				_ = tlsConn.Close()
 				return
 			case <-stopPushRequests:
+				return
+			case <-ws.workersManager.ShouldShutdown():
+				_ = tlsConn.Close()
 				return
 			}
 		}
@@ -398,7 +413,7 @@ func (ws *workersState) applyPushedCipher(opts remoteOptions) {
 }
 
 func canonicalSupportedCipher(cipher string) (string, bool) {
-	for _, supported := range config.SupportedCiphers {
+	for _, supported := range vpnconfig.SupportedCiphers {
 		if strings.EqualFold(supported, cipher) {
 			return supported, true
 		}

@@ -163,6 +163,9 @@ type reliableSender struct {
 
 	// pendingACKsToSend is a set of packets that we still need to ACK.
 	pendingACKsToSend *ackSet
+
+	// rtt tracks RTT estimates for dynamic ACK grace period calculation.
+	rtt *rttTracker
 }
 
 // newReliableSender returns a new instance of reliableOutgoing.
@@ -172,6 +175,7 @@ func newReliableSender(logger model.Logger, ch chan incomingPacketSeen) *reliabl
 		inFlight:          make([]*inFlightPacket, 0, RELIABLE_SEND_BUFFER_SIZE),
 		logger:            logger,
 		pendingACKsToSend: newACKSet(),
+		rtt:               newRTTTracker(),
 	}
 }
 
@@ -205,6 +209,7 @@ func (r *reliableSender) OnIncomingPacketSeen(seen incomingPacketSeen) {
 // either evicts it (if the PacketID matches), or bumps the internal withHigherACK count in the
 // packet (if the PacketID from the ACK is higher than the packet in the queue).
 func (r *reliableSender) maybeEvictOrMarkWithHigherACK(acked model.PacketID) {
+	now := time.Now()
 	pkts := r.inFlight
 	for i, p := range pkts {
 		if p.packet == nil {
@@ -217,6 +222,14 @@ func (r *reliableSender) maybeEvictOrMarkWithHigherACK(acked model.PacketID) {
 			// we have a match for the ack we just received: eviction it is!
 			r.logger.Debugf("evicting packet %v", p.packet.ID)
 
+			// Update RTT estimate only for packets that were not retransmitted,
+			// since retransmitted packets have ambiguous RTT (Karn's algorithm).
+			if p.retries == 1 && !p.sentAt.IsZero() {
+				rttSample := now.Sub(p.sentAt)
+				r.rtt.Update(rttSample)
+				r.logger.Debugf("RTT sample: %v, smoothed: %v", rttSample, r.rtt.SmoothedRTT())
+			}
+
 			// first we swap this element with the last one:
 			pkts[i], pkts[len(pkts)-1] = pkts[len(pkts)-1], pkts[i]
 
@@ -228,7 +241,7 @@ func (r *reliableSender) maybeEvictOrMarkWithHigherACK(acked model.PacketID) {
 }
 
 // shouldRescheduleAfterACK checks whether we need to wakeup after receiving an ACK.
-// TODO: change this depending on the handshake state --------------------------
+// Uses dynamic grace period based on RTT when available.
 func (r *reliableSender) shouldWakeupAfterACK(t time.Time) (bool, time.Duration) {
 	if r.pendingACKsToSend.Len() <= 0 {
 		return false, time.Minute
@@ -241,9 +254,12 @@ func (r *reliableSender) shouldWakeupAfterACK(t time.Time) (bool, time.Duration)
 	// scheduled to go out in this time.
 	timeout := inflightSequence(r.inFlight).nearestDeadlineTo(t)
 
-	if timeout.Sub(t) > gracePeriodForOutgoingACKs {
-		r.logger.Debugf("next wakeup too late, schedule in %v", gracePeriodForOutgoingACKs)
-		return true, gracePeriodForOutgoingACKs
+	// Use dynamic grace period based on RTT, falling back to default if no RTT data
+	gracePeriod := r.rtt.GracePeriod()
+
+	if timeout.Sub(t) > gracePeriod {
+		r.logger.Debugf("next wakeup too late, schedule in %v (RTT-based)", gracePeriod)
+		return true, gracePeriod
 	}
 	return true, timeout.Sub(t)
 }

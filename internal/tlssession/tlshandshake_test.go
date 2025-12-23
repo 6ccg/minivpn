@@ -738,3 +738,250 @@ func Test_customVerify(t *testing.T) {
 		}
 	})
 }
+
+func Test_formatSubjectDN(t *testing.T) {
+	tests := []struct {
+		name    string
+		subject pkix.Name
+		want    string
+	}{
+		{
+			name: "full subject DN",
+			subject: pkix.Name{
+				Country:            []string{"KG"},
+				Province:           []string{"NA"},
+				Locality:           []string{"Bishkek"},
+				Organization:       []string{"MyOrg"},
+				OrganizationalUnit: []string{"MyOU"},
+				CommonName:         "Server-1",
+			},
+			want: "C=KG, ST=NA, L=Bishkek, O=MyOrg, OU=MyOU, CN=Server-1",
+		},
+		{
+			name: "only common name",
+			subject: pkix.Name{
+				CommonName: "vpn.example.com",
+			},
+			want: "CN=vpn.example.com",
+		},
+		{
+			name: "country and common name only",
+			subject: pkix.Name{
+				Country:    []string{"US"},
+				CommonName: "test-server",
+			},
+			want: "C=US, CN=test-server",
+		},
+		{
+			name:    "empty subject",
+			subject: pkix.Name{},
+			want:    "",
+		},
+		{
+			name: "multiple countries",
+			subject: pkix.Name{
+				Country:    []string{"US", "CA"},
+				CommonName: "multi-country",
+			},
+			want: "C=US, C=CA, CN=multi-country",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatSubjectDN(tt.subject)
+			if got != tt.want {
+				t.Errorf("formatSubjectDN() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func Test_verifyX509Name(t *testing.T) {
+	// Create a test certificate with known subject
+	testCert := &x509.Certificate{
+		Subject: pkix.Name{
+			Country:      []string{"KG"},
+			Province:     []string{"NA"},
+			Locality:     []string{"Bishkek"},
+			Organization: []string{"TestOrg"},
+			CommonName:   "vpn.example.com",
+		},
+	}
+
+	tests := []struct {
+		name         string
+		cert         *x509.Certificate
+		expectedName string
+		verifyType   config.VerifyX509Type
+		wantErr      error
+	}{
+		// VerifyX509SubjectDN tests
+		{
+			name:         "subject DN exact match",
+			cert:         testCert,
+			expectedName: "C=KG, ST=NA, L=Bishkek, O=TestOrg, CN=vpn.example.com",
+			verifyType:   config.VerifyX509SubjectDN,
+			wantErr:      nil,
+		},
+		{
+			name:         "subject DN mismatch",
+			cert:         testCert,
+			expectedName: "C=US, ST=CA, L=SanFrancisco, O=OtherOrg, CN=other.example.com",
+			verifyType:   config.VerifyX509SubjectDN,
+			wantErr:      ErrX509NameMismatch,
+		},
+
+		// VerifyX509SubjectRDN (name) tests
+		{
+			name:         "CN exact match",
+			cert:         testCert,
+			expectedName: "vpn.example.com",
+			verifyType:   config.VerifyX509SubjectRDN,
+			wantErr:      nil,
+		},
+		{
+			name:         "CN mismatch",
+			cert:         testCert,
+			expectedName: "other.example.com",
+			verifyType:   config.VerifyX509SubjectRDN,
+			wantErr:      ErrX509NameMismatch,
+		},
+
+		// VerifyX509SubjectRDNPrefix (name-prefix) tests
+		{
+			name:         "CN prefix match",
+			cert:         testCert,
+			expectedName: "vpn.",
+			verifyType:   config.VerifyX509SubjectRDNPrefix,
+			wantErr:      nil,
+		},
+		{
+			name:         "CN prefix full match",
+			cert:         testCert,
+			expectedName: "vpn.example.com",
+			verifyType:   config.VerifyX509SubjectRDNPrefix,
+			wantErr:      nil,
+		},
+		{
+			name:         "CN prefix mismatch",
+			cert:         testCert,
+			expectedName: "other.",
+			verifyType:   config.VerifyX509SubjectRDNPrefix,
+			wantErr:      ErrX509NameMismatch,
+		},
+
+		// VerifyX509None - should always pass
+		{
+			name:         "no verification type",
+			cert:         testCert,
+			expectedName: "anything",
+			verifyType:   config.VerifyX509None,
+			wantErr:      nil,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := verifyX509Name(tt.cert, tt.expectedName, tt.verifyType)
+			if !errors.Is(err, tt.wantErr) {
+				t.Errorf("verifyX509Name() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func Test_customVerifyWithX509Name(t *testing.T) {
+	t.Run("verify-x509-name subject succeeds with matching DN", func(t *testing.T) {
+		rawCerts, ca, vpnCert, vpnKey, err := makeRawCertsForTesting()
+		if err != nil {
+			t.Errorf("error getting raw certs: %v", err)
+			return
+		}
+
+		auth, err := makeCertAndCAFromMemory(ca, vpnCert, vpnKey)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		// The test cert has O=Oonitarians united, CN=random.gateway
+		auth.verifyX509Type = config.VerifyX509SubjectRDN
+		auth.verifyX509Name = "random.gateway"
+
+		customVerify := customVerifyFactory(auth)
+		err = customVerify(rawCerts, nil)
+		if err != nil {
+			t.Errorf("customVerify() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("verify-x509-name fails with non-matching CN", func(t *testing.T) {
+		rawCerts, ca, vpnCert, vpnKey, err := makeRawCertsForTesting()
+		if err != nil {
+			t.Errorf("error getting raw certs: %v", err)
+			return
+		}
+
+		auth, err := makeCertAndCAFromMemory(ca, vpnCert, vpnKey)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		auth.verifyX509Type = config.VerifyX509SubjectRDN
+		auth.verifyX509Name = "wrong.gateway"
+
+		customVerify := customVerifyFactory(auth)
+		err = customVerify(rawCerts, nil)
+		if !errors.Is(err, ErrX509NameMismatch) {
+			t.Errorf("customVerify() error = %v, want %v", err, ErrX509NameMismatch)
+		}
+	})
+
+	t.Run("verify-x509-name prefix succeeds", func(t *testing.T) {
+		rawCerts, ca, vpnCert, vpnKey, err := makeRawCertsForTesting()
+		if err != nil {
+			t.Errorf("error getting raw certs: %v", err)
+			return
+		}
+
+		auth, err := makeCertAndCAFromMemory(ca, vpnCert, vpnKey)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		auth.verifyX509Type = config.VerifyX509SubjectRDNPrefix
+		auth.verifyX509Name = "random."
+
+		customVerify := customVerifyFactory(auth)
+		err = customVerify(rawCerts, nil)
+		if err != nil {
+			t.Errorf("customVerify() error = %v, want nil", err)
+		}
+	})
+
+	t.Run("no verify-x509-name configured always passes", func(t *testing.T) {
+		rawCerts, ca, vpnCert, vpnKey, err := makeRawCertsForTesting()
+		if err != nil {
+			t.Errorf("error getting raw certs: %v", err)
+			return
+		}
+
+		auth, err := makeCertAndCAFromMemory(ca, vpnCert, vpnKey)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		// Default: no X509 name verification
+		auth.verifyX509Type = config.VerifyX509None
+		auth.verifyX509Name = ""
+
+		customVerify := customVerifyFactory(auth)
+		err = customVerify(rawCerts, nil)
+		if err != nil {
+			t.Errorf("customVerify() error = %v, want nil", err)
+		}
+	})
+}

@@ -1,7 +1,10 @@
-package datachannel
+// Package replay implements replay attack detection for OpenVPN control and data channels.
+// It uses a sliding window algorithm similar to IPSec and OpenVPN's packet_id mechanism.
+package replay
 
 import (
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/ooni/minivpn/internal/model"
@@ -14,7 +17,6 @@ const (
 
 	// DefaultTimeBacktrack is the default time window in seconds for replay protection.
 	// This matches OpenVPN's DEFAULT_TIME_BACKTRACK of 15 seconds.
-	// Packets older than this will be rejected even if within the sequence window.
 	DefaultTimeBacktrack = 15
 
 	// SeqReapInterval is the interval in seconds between reap passes.
@@ -24,7 +26,6 @@ const (
 	// MaxTimestampDelta is the maximum allowed difference between packet timestamp
 	// and local time in seconds. Packets outside this range are rejected.
 	// This provides protection against delayed replay attacks.
-	// This matches OpenVPN's check_timestamp_delta() behavior.
 	MaxTimestampDelta = 60
 
 	// seqUnseen indicates a packet ID slot that has not been seen yet.
@@ -40,6 +41,12 @@ const (
 )
 
 var (
+	// ErrReplayAttack is returned when a replay attack is detected.
+	ErrReplayAttack = errors.New("replay attack detected")
+
+	// ErrInvalidPacketID is returned when the packet ID is zero.
+	ErrInvalidPacketID = errors.New("invalid packet ID (zero)")
+
 	// ErrTimestampOutOfRange is returned when the packet timestamp is too far from local time.
 	ErrTimestampOutOfRange = errors.New("packet timestamp out of acceptable range")
 )
@@ -59,7 +66,7 @@ func packetIDDiff(a, b model.PacketID) uint32 {
 	return uint32(a - b)
 }
 
-// replayFilter implements a sliding window algorithm for replay attack detection,
+// Filter implements a sliding window algorithm for replay attack detection,
 // similar to IPSec and OpenVPN's packet_id_test mechanism.
 //
 // It supports both:
@@ -68,14 +75,9 @@ func packetIDDiff(a, b model.PacketID) uint32 {
 //
 // Additionally, it implements time_backtrack protection which expires packet IDs
 // that are older than a configurable time window, preventing delayed replay attacks.
-//
-// It also supports optional timestamp validation (check_timestamp_delta) which
-// validates packet timestamps against local time to prevent long-term replay attacks.
-//
-// Thread Safety: This type is NOT thread-safe. Callers must hold an external lock
-// before calling any methods. This matches OpenVPN's single-threaded design where
-// packet_id_test() is called without locks.
-type replayFilter struct {
+type Filter struct {
+	mu sync.Mutex
+
 	// maxID is the highest packet ID we've seen so far
 	maxID model.PacketID
 
@@ -102,131 +104,125 @@ type replayFilter struct {
 	backtrackMode bool
 
 	// validateTimestamp enables timestamp validation against local time
-	// This matches OpenVPN's check_timestamp_delta() functionality
 	validateTimestamp bool
 
-	// maxTimestampDelta is the maximum allowed difference from local time in seconds
+	// maxTimestampDelta is the maximum allowed difference from local time
 	maxTimestampDelta int
 
 	// initialized tracks whether we've received any packets yet
 	initialized bool
 }
 
-// newReplayFilter creates a new replay filter with the specified window size.
-// If backtrackMode is true, out-of-order packets within the window are allowed.
-// Uses default time backtrack of 15 seconds.
-func newReplayFilter(windowSize uint32, backtrackMode bool) *replayFilter {
-	return newReplayFilterWithTimeBacktrack(windowSize, DefaultTimeBacktrack, backtrackMode)
+// FilterOption is a functional option for configuring a Filter.
+type FilterOption func(*Filter)
+
+// WithTimeBacktrack sets the time backtrack window in seconds.
+func WithTimeBacktrack(seconds int) FilterOption {
+	return func(f *Filter) {
+		if seconds >= 0 {
+			f.timeBacktrack = seconds
+		}
+	}
 }
 
-// newReplayFilterWithTimeBacktrack creates a new replay filter with custom time backtrack.
-// windowSize: number of packet IDs to track (max 65536, default 64)
-// timeBacktrack: maximum age in seconds for packets (0 to disable, default 15)
-// backtrackMode: true for UDP (allows reordering), false for TCP (sequential only)
-func newReplayFilterWithTimeBacktrack(windowSize uint32, timeBacktrack int, backtrackMode bool) *replayFilter {
+// WithTimestampValidation enables validation of packet timestamps against local time.
+func WithTimestampValidation(maxDelta int) FilterOption {
+	return func(f *Filter) {
+		f.validateTimestamp = true
+		f.maxTimestampDelta = maxDelta
+	}
+}
+
+// WithBacktrackMode enables or disables backtrack mode (UDP vs TCP).
+func WithBacktrackMode(enabled bool) FilterOption {
+	return func(f *Filter) {
+		f.backtrackMode = enabled
+	}
+}
+
+// NewFilter creates a new replay filter with the specified window size.
+// Default configuration: backtrack mode enabled (UDP), time backtrack of 15 seconds.
+func NewFilter(windowSize uint32, opts ...FilterOption) *Filter {
 	if windowSize > 65536 {
 		windowSize = 65536
 	}
 	if windowSize == 0 {
 		windowSize = DefaultSeqBacktrack
 	}
-	if timeBacktrack < 0 {
-		timeBacktrack = 0
-	}
 
-	return &replayFilter{
+	f := &Filter{
 		windowSize:        windowSize,
-		timeBacktrack:     timeBacktrack,
+		timeBacktrack:     DefaultTimeBacktrack,
 		seqList:           make([]int64, windowSize),
-		backtrackMode:     backtrackMode,
+		backtrackMode:     true, // default to UDP mode
 		validateTimestamp: false,
 		maxTimestampDelta: MaxTimestampDelta,
 		initialized:       false,
 		lastReap:          0,
 	}
-}
 
-// ReplayFilterOption is a functional option for configuring a replayFilter.
-type ReplayFilterOption func(*replayFilter)
-
-// WithTimestampValidation enables validation of packet timestamps against local time.
-// This matches OpenVPN's check_timestamp_delta() functionality.
-// maxDelta: maximum allowed difference between packet timestamp and local time in seconds
-func WithTimestampValidation(maxDelta int) ReplayFilterOption {
-	return func(rf *replayFilter) {
-		rf.validateTimestamp = true
-		if maxDelta > 0 {
-			rf.maxTimestampDelta = maxDelta
-		}
-	}
-}
-
-// newReplayFilterWithOptions creates a new replay filter with functional options.
-func newReplayFilterWithOptions(windowSize uint32, backtrackMode bool, opts ...ReplayFilterOption) *replayFilter {
-	rf := newReplayFilterWithTimeBacktrack(windowSize, DefaultTimeBacktrack, backtrackMode)
 	for _, opt := range opts {
-		opt(rf)
+		opt(f)
 	}
-	return rf
+
+	return f
 }
 
 // Check tests whether a packet ID should be accepted or rejected.
-// Returns nil if the packet is valid, ErrReplayAttack if it's a replay.
-func (rf *replayFilter) Check(id model.PacketID) error {
-	return rf.CheckWithTimestamp(id, 0)
+// Returns nil if the packet is valid, an error if it should be rejected.
+func (f *Filter) Check(id model.PacketID) error {
+	return f.CheckWithTimestamp(id, 0)
 }
 
 // CheckWithTimestamp tests whether a packet ID and timestamp should be accepted.
 // If timestamp is 0, timestamp validation is skipped.
 // Returns nil if the packet is valid, an error if it should be rejected.
-// This matches OpenVPN's packet_id_test() with check_timestamp_delta() functionality.
-//
-// Thread Safety: Caller must hold an external lock.
-func (rf *replayFilter) CheckWithTimestamp(id model.PacketID, timestamp model.PacketTimestamp) error {
+func (f *Filter) CheckWithTimestamp(id model.PacketID, timestamp model.PacketTimestamp) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	now := time.Now().Unix()
 
 	// Perform periodic reap to expire old entries
-	rf.reapTestLocked(now)
+	f.reapTestLocked(now)
 
 	// Packet ID 0 is invalid in OpenVPN
 	if id == 0 {
-		return ErrReplayAttack
+		return ErrInvalidPacketID
 	}
 
 	// Validate timestamp if enabled and timestamp is provided
-	// This matches OpenVPN's check_timestamp_delta() in packet_id.h
-	if rf.validateTimestamp && timestamp > 0 {
-		if err := rf.checkTimestampLocked(timestamp, now); err != nil {
+	if f.validateTimestamp && timestamp > 0 {
+		if err := f.checkTimestampLocked(timestamp, now); err != nil {
 			return err
 		}
 	}
 
 	// First packet: accept and initialize
-	if !rf.initialized {
-		rf.maxID = id
+	if !f.initialized {
+		f.maxID = id
 		if timestamp > 0 {
-			rf.maxTime = timestamp
+			f.maxTime = timestamp
 		}
-		rf.resetSeqListLocked()
-		rf.seqList[0] = now // mark position 0 as seen with current timestamp
-		rf.initialized = true
+		f.resetSeqListLocked()
+		f.seqList[0] = now // mark position 0 as seen with current timestamp
+		f.initialized = true
 		return nil
 	}
 
 	// In backtrack mode (UDP), we allow packet reordering subject to
 	// seq_backtrack and time_backtrack constraints.
-	if rf.backtrackMode {
-		return rf.checkBacktrackModeLocked(id, timestamp, now)
+	if f.backtrackMode {
+		return f.checkBacktrackModeLocked(id, timestamp, now)
 	}
 
 	// In sequential mode (TCP), packets must arrive in order
-	return rf.checkSequentialModeLocked(id, timestamp, now)
+	return f.checkSequentialModeLocked(id, timestamp, now)
 }
 
 // checkTimestampLocked validates the packet timestamp against local time.
-// This matches OpenVPN's check_timestamp_delta() function in packet_id.h.
-// Must be called with external lock held.
-func (rf *replayFilter) checkTimestampLocked(timestamp model.PacketTimestamp, now int64) error {
+// Must be called with f.mu held.
+func (f *Filter) checkTimestampLocked(timestamp model.PacketTimestamp, now int64) error {
 	remote := int64(timestamp)
 	var delta int64
 	if now >= remote {
@@ -235,73 +231,52 @@ func (rf *replayFilter) checkTimestampLocked(timestamp model.PacketTimestamp, no
 		delta = remote - now
 	}
 
-	if delta > int64(rf.maxTimestampDelta) {
+	if delta > int64(f.maxTimestampDelta) {
 		return ErrTimestampOutOfRange
 	}
 	return nil
 }
 
 // checkBacktrackModeLocked handles replay check for UDP mode (allows reordering).
-// Must be called with external lock held.
-func (rf *replayFilter) checkBacktrackModeLocked(id model.PacketID, timestamp model.PacketTimestamp, now int64) error {
-	// First check time period if timestamps are available.
-	// This matches OpenVPN's packet_id_test() behavior in backtrack mode:
-	// - time goes back: reject immediately
-	// - time goes forward: accept immediately and reset window
-	// - same time period: check sliding window
-	if timestamp > 0 && rf.maxTime > 0 {
-		if timestamp < rf.maxTime {
-			// Time went backwards - reject
-			return ErrReplayAttack
-		}
-		if timestamp > rf.maxTime {
-			// Time moved forward - accept and reset window for new time period
-			rf.maxID = id
-			rf.maxTime = timestamp
-			rf.resetSeqListLocked()
-			rf.seqList[0] = now
-			return nil
-		}
-		// timestamp == rf.maxTime: continue to check ID within same time period
-	}
-
+// Must be called with f.mu held.
+func (f *Filter) checkBacktrackModeLocked(id model.PacketID, timestamp model.PacketTimestamp, now int64) error {
 	// Case 1: New packet ID is ahead of maxID (using wraparound-safe comparison)
-	if packetIDAfter(id, rf.maxID) {
-		shift := packetIDDiff(id, rf.maxID)
+	if packetIDAfter(id, f.maxID) {
+		shift := packetIDDiff(id, f.maxID)
 
-		if shift >= rf.windowSize {
+		if shift >= f.windowSize {
 			// Packet is far ahead, reset the window
-			rf.resetSeqListLocked()
+			f.resetSeqListLocked()
 		} else {
 			// Shift the seqList forward
-			rf.shiftSeqListLocked(shift)
+			f.shiftSeqListLocked(shift)
 		}
 
-		rf.maxID = id
-		if timestamp > rf.maxTime {
-			rf.maxTime = timestamp
+		f.maxID = id
+		if timestamp > f.maxTime {
+			f.maxTime = timestamp
 		}
-		rf.seqList[0] = now // mark new position as seen
+		f.seqList[0] = now // mark new position as seen
 		return nil
 	}
 
 	// Case 2: Packet ID equals maxID (duplicate)
-	if id == rf.maxID {
+	if id == f.maxID {
 		return ErrReplayAttack
 	}
 
 	// Case 3: Packet ID is behind maxID (out of order, using wraparound-safe diff)
-	diff := packetIDDiff(rf.maxID, id)
+	diff := packetIDDiff(f.maxID, id)
 
 	// Check if packet is within the window
-	if diff >= rf.windowSize {
+	if diff >= f.windowSize {
 		// Packet is too old (outside the window)
 		return ErrReplayAttack
 	}
 
 	// Check if this packet ID was already seen or expired
 	idx := diff
-	seenTime := rf.seqList[idx]
+	seenTime := f.seqList[idx]
 
 	if seenTime == seqExpired {
 		// Packet has expired due to time_backtrack
@@ -314,7 +289,7 @@ func (rf *replayFilter) checkBacktrackModeLocked(id model.PacketID, timestamp mo
 	}
 
 	// Mark as seen with current timestamp
-	rf.seqList[idx] = now
+	f.seqList[idx] = now
 	return nil
 }
 
@@ -322,16 +297,13 @@ func (rf *replayFilter) checkBacktrackModeLocked(id model.PacketID, timestamp mo
 // This matches OpenVPN's packet_id_test() for non-backtrack mode.
 // In non-backtrack mode, all sequence number series must begin at some number n > 0
 // and must increment linearly without gaps.
-// Must be called with external lock held.
-func (rf *replayFilter) checkSequentialModeLocked(id model.PacketID, timestamp model.PacketTimestamp, now int64) error {
-	// For data channel (short-form packet ID, no timestamp), timestamp is always 0.
-	// For long-form with timestamp, we need to handle time period changes.
-
-	// Case 1: Same time period (or both timestamps are 0 for short-form)
-	if timestamp == rf.maxTime {
-		// First packet in this time period (maxID == 0), or strictly sequential (id == maxID+1)
-		if rf.maxID == 0 || id == rf.maxID+1 {
-			rf.maxID = id
+// Must be called with f.mu held.
+func (f *Filter) checkSequentialModeLocked(id model.PacketID, timestamp model.PacketTimestamp, now int64) error {
+	// Case 1: Same time period - packet ID must be strictly sequential
+	if timestamp == f.maxTime {
+		// First packet in this time period, or strictly sequential
+		if f.maxID == 0 || id == f.maxID+1 {
+			f.maxID = id
 			return nil
 		}
 		// Not sequential - reject (gap or duplicate or out of order)
@@ -339,14 +311,14 @@ func (rf *replayFilter) checkSequentialModeLocked(id model.PacketID, timestamp m
 	}
 
 	// Case 2: Time went backwards - reject
-	if timestamp < rf.maxTime {
+	if timestamp < f.maxTime {
 		return ErrReplayAttack
 	}
 
 	// Case 3: Time moved forward - new time period, ID must be 1
 	if id == 1 {
-		rf.maxID = id
-		rf.maxTime = timestamp
+		f.maxID = id
+		f.maxTime = timestamp
 		return nil
 	}
 
@@ -355,27 +327,27 @@ func (rf *replayFilter) checkSequentialModeLocked(id model.PacketID, timestamp m
 }
 
 // reapTestLocked checks if it's time to run a reap operation.
-// Must be called with external lock held.
-func (rf *replayFilter) reapTestLocked(now int64) {
-	if rf.timeBacktrack > 0 && rf.lastReap+SeqReapInterval <= now {
-		rf.reapLocked(now)
+// Must be called with f.mu held.
+func (f *Filter) reapTestLocked(now int64) {
+	if f.timeBacktrack > 0 && f.lastReap+SeqReapInterval <= now {
+		f.reapLocked(now)
 	}
 }
 
 // reapLocked expires sequence numbers which can no longer be accepted
 // because they would violate time_backtrack.
-// Must be called with external lock held.
-func (rf *replayFilter) reapLocked(now int64) {
-	if rf.timeBacktrack == 0 {
-		rf.lastReap = now
+// Must be called with f.mu held.
+func (f *Filter) reapLocked(now int64) {
+	if f.timeBacktrack == 0 {
+		f.lastReap = now
 		return
 	}
 
-	expireThreshold := now - int64(rf.timeBacktrack)
+	expireThreshold := now - int64(f.timeBacktrack)
 	expired := false
 
-	for i := uint32(0); i < rf.windowSize; i++ {
-		t := rf.seqList[i]
+	for i := uint32(0); i < f.windowSize; i++ {
+		t := f.seqList[i]
 
 		if t == seqExpired {
 			// Already expired, everything after this is also expired
@@ -388,52 +360,54 @@ func (rf *replayFilter) reapLocked(now int64) {
 		}
 
 		if expired {
-			rf.seqList[i] = seqExpired
+			f.seqList[i] = seqExpired
 		}
 	}
 
-	rf.lastReap = now
+	f.lastReap = now
 }
 
 // shiftSeqListLocked shifts the seqList forward by the specified amount.
-// Must be called with external lock held.
-func (rf *replayFilter) shiftSeqListLocked(shift uint32) {
-	if shift >= rf.windowSize {
-		rf.resetSeqListLocked()
+// Must be called with f.mu held.
+func (f *Filter) shiftSeqListLocked(shift uint32) {
+	if shift >= f.windowSize {
+		f.resetSeqListLocked()
 		return
 	}
 
 	// Shift entries forward (newer entries at lower indices)
-	for i := rf.windowSize - 1; i >= shift; i-- {
-		rf.seqList[i] = rf.seqList[i-shift]
+	for i := f.windowSize - 1; i >= shift; i-- {
+		f.seqList[i] = f.seqList[i-shift]
 	}
 
 	// Clear the new positions
 	for i := uint32(0); i < shift; i++ {
-		rf.seqList[i] = seqUnseen
+		f.seqList[i] = seqUnseen
 	}
 }
 
 // resetSeqListLocked resets all entries in the seqList to unseen.
-func (rf *replayFilter) resetSeqListLocked() {
-	for i := range rf.seqList {
-		rf.seqList[i] = seqUnseen
+// Must be called with f.mu held.
+func (f *Filter) resetSeqListLocked() {
+	for i := range f.seqList {
+		f.seqList[i] = seqUnseen
 	}
 }
 
 // Reset clears the replay filter state.
-//
-// Thread Safety: Caller must hold an external lock.
-func (rf *replayFilter) Reset() {
-	rf.maxID = 0
-	rf.resetSeqListLocked()
-	rf.initialized = false
-	rf.lastReap = 0
+func (f *Filter) Reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.maxID = 0
+	f.maxTime = 0
+	f.resetSeqListLocked()
+	f.initialized = false
+	f.lastReap = 0
 }
 
 // MaxID returns the highest packet ID seen so far.
-//
-// Thread Safety: Caller must hold an external lock.
-func (rf *replayFilter) MaxID() model.PacketID {
-	return rf.maxID
+func (f *Filter) MaxID() model.PacketID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.maxID
 }

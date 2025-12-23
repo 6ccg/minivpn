@@ -100,21 +100,34 @@ func (ws *workersState) moveUpWorker() {
 
 			case model.P_CONTROL_SOFT_RESET_V1:
 				// We cannot blindly accept SOFT_RESET requests. They only make sense
-				// when we have generated keys. Note that a SOFT_RESET returns us to
-				// the INITIAL state, therefore, we will not have concurrent resets in place,
-				// even if after the first key generation we receive two SOFT_RESET requests
-				// back to back.
+				// when we have received the remote's key material (S_GOT_KEY or later).
+				// This matches OpenVPN's DECRYPT_KEY_ENABLED check for client mode.
+				// Note that a SOFT_RESET returns us to the INITIAL state, therefore,
+				// we will not have concurrent resets in place, even if after the first
+				// key generation we receive two SOFT_RESET requests back to back.
 
-				if ws.sessionManager.NegotiationState() < model.S_GENERATED_KEYS {
+				if ws.sessionManager.NegotiationState() < model.S_GOT_KEY {
+					packet.Free() // release buffer back to pool
 					continue
 				}
+
+				// Perform key soft reset: move current key to lame duck slot,
+				// prepare for new key negotiation. This preserves the old key
+				// for transition_window seconds to allow in-flight packets.
+				if err := ws.sessionManager.KeySoftReset(); err != nil {
+					ws.logger.Warnf("%s: soft reset failed: %v", workerName, err)
+					packet.Free() // release buffer back to pool
+					continue
+				}
+
+				// Advance the key ID for the new key negotiation.
+				// This follows OpenVPN's key_id cycling: 0→1→2→...→7→1→...
+				newKeyID := ws.sessionManager.NextKeyID()
+				ws.logger.Debugf("%s: server-initiated SOFT_RESET, new key_id=%d", workerName, newKeyID)
 				ws.sessionManager.SetNegotiationState(model.S_INITIAL)
-				// TODO(ainghazal): revisit this step.
-				// when we implement key rotation.  OpenVPN has
-				// the concept of a "lame duck", i.e., the
-				// retiring key that needs to be expired a fixed time after the new
-				// one starts its lifetime, and this might be a good place to try
-				// to retire the old key.
+
+				// Release buffer now - no longer needed
+				packet.Free()
 
 				// notify the TLS layer that it should initiate
 				// a TLS handshake and, if successful, generate
@@ -137,11 +150,16 @@ func (ws *workersState) moveUpWorker() {
 						len(packet.Payload),
 						bytesx.HexPrefix(packet.Payload, 32),
 					)
-					// nothing
+					// TLS layer copies payload via bytes.Buffer.Write(),
+					// so we can safely release the buffer now.
+					packet.Free()
 
 				case <-ws.workersManager.ShouldShutdown():
 					return
 				}
+			default:
+				// Unknown opcode, release buffer
+				packet.Free()
 			}
 
 		case <-ws.workersManager.ShouldShutdown():

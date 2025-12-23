@@ -7,6 +7,7 @@ import (
 
 	"github.com/apex/log"
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/session"
 	"github.com/ooni/minivpn/pkg/config"
@@ -150,7 +151,7 @@ func Test_DataChannel_writePacket(t *testing.T) {
 				t.Errorf("data.WritePacket() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if diff := cmp.Diff(got, tt.want); diff != "" {
+			if diff := cmp.Diff(got, tt.want, cmpopts.IgnoreUnexported(model.Packet{})); diff != "" {
 				t.Errorf(diff)
 			}
 		})
@@ -221,7 +222,7 @@ func Test_DataChannel_deadPacket(t *testing.T) {
 				t.Errorf("data.ReadPacket() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
-			if diff := cmp.Diff(got, tt.want); diff != "" {
+			if diff := cmp.Diff(got, tt.want, cmpopts.IgnoreUnexported(model.Packet{})); diff != "" {
 				t.Errorf(diff)
 			}
 		})

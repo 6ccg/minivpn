@@ -25,4 +25,10 @@ var (
 	ErrSerialization = errors.New("cannot create packet")
 	ErrCannotEncrypt = errors.New("cannot encrypt")
 	ErrCannotDecrypt = errors.New("cannot decrypt")
+
+	// Fragment errors
+	ErrFragmentTooMany     = errors.New("fragment: too many fragments required")
+	ErrFragmentBadType     = errors.New("fragment: unknown fragment type")
+	ErrFragmentBadSize     = errors.New("fragment: bad fragment size")
+	ErrFragmentBufOverflow = errors.New("fragment: buffer overflow")
 )

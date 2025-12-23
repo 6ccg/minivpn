@@ -47,6 +47,10 @@ func NewDataChannelFromOptions(logger model.Logger,
 	runtimex.Assert(len(opt.Auth) != 0, "need a configured auth option")
 
 	state := &dataChannelState{}
+	// Initialize replay filter with appropriate mode:
+	// - UDP: backtrack mode (allows out-of-order packets within window)
+	// - TCP: sequential mode (requires strictly increasing packet IDs)
+	state.initReplayFilter(!opt.Proto.IsTCP())
 	data := &DataChannel{
 		options:        opt,
 		sessionManager: sessionManager,
@@ -138,9 +142,68 @@ func (d *DataChannel) setupKeys(dck *session.DataChannelKey) error {
 	return nil
 }
 
+// SetupKeysForSlot derives keys for a specific slot and key ID.
+// This is used during key renegotiation to set up the new key in KS_PRIMARY
+// while the old key remains in KS_LAME_DUCK.
+func (d *DataChannel) SetupKeysForSlot(dck *session.DataChannelKey, slot int, keyID uint8) error {
+	runtimex.Assert(dck != nil, "data channel key cannot be nil")
+	if !dck.Ready() {
+		return fmt.Errorf("%w: %s", errDataChannelKey, "key not ready")
+	}
+
+	km := NewKeyMaterial(keyID)
+	backtrackMode := !d.options.Proto.IsTCP()
+
+	err := km.DeriveKeys(
+		dck,
+		d.sessionManager.LocalSessionID(),
+		d.sessionManager.RemoteSessionID(),
+		d.state.dataCipher,
+		d.state.hash,
+		backtrackMode,
+	)
+	if err != nil {
+		return err
+	}
+
+	d.state.SetKeyMaterial(slot, km)
+
+	// Also update legacy fields for backward compatibility when setting primary key
+	if slot == session.KS_PRIMARY {
+		d.state.cipherKeyLocal = km.GetCipherKeyLocal()
+		d.state.hmacKeyLocal = km.GetHmacKeyLocal()
+		d.state.cipherKeyRemote = km.GetCipherKeyRemote()
+		d.state.hmacKeyRemote = km.GetHmacKeyRemote()
+		d.state.hmacLocal = km.HmacLocal()
+		d.state.hmacRemote = km.HmacRemote()
+	}
+
+	d.log.Infof("Key material derived for slot %d, key_id %d", slot, keyID)
+	return nil
+}
+
+// ExpireLameDuck clears the lame duck key slot.
+func (d *DataChannel) ExpireLameDuck() {
+	d.state.ClearSlot(session.KS_LAME_DUCK)
+	d.log.Debug("Lame duck key expired and cleared")
+}
+
 //
 // write + encrypt
 //
+
+// createDataPacket creates a data packet from an already-encrypted payload.
+// This is used by fragmentation to wrap fragment data in proper packet headers.
+func (d *DataChannel) createDataPacket(encryptedPayload []byte) *model.Packet {
+	opcode := dataOpcode(d.sessionManager)
+	packet := model.NewPacket(opcode, d.sessionManager.CurrentKeyID(), encryptedPayload)
+	if opcode == model.P_DATA_V2 {
+		peerid := &bytes.Buffer{}
+		bytesx.WriteUint24(peerid, uint32(d.sessionManager.TunnelInfo().PeerID))
+		packet.PeerID = model.PeerID(peerid.Bytes())
+	}
+	return packet
+}
 
 func (d *DataChannel) writePacket(payload []byte) (*model.Packet, error) {
 	runtimex.Assert(d.state != nil, "data: nil state")
@@ -213,6 +276,20 @@ func (d *DataChannel) readPacket(p *model.Packet) ([]byte, error) {
 	}
 	runtimex.Assert(p.IsData(), "ReadPacket expects data packet")
 
+	// Try multi-key decryption first: look up key material by packet's key_id
+	km, slotIdx := d.state.GetKeyMaterialByID(p.KeyID)
+	if km != nil {
+		plaintext, err := d.decryptWithKeyMaterial(p.Payload, km)
+		if err != nil {
+			return nil, err
+		}
+		// Update counters on the correct key slot
+		d.sessionManager.AddKeyBytes(slotIdx, int64(len(p.Payload)), 0)
+		d.sessionManager.AddKeyPackets(slotIdx, 1, 0)
+		return maybeDecompress(plaintext, d.state, d.options)
+	}
+
+	// Fallback to legacy single-key decryption (for backward compatibility)
 	plaintext, err := d.decrypt(p.Payload)
 	if err != nil {
 		return nil, err
@@ -220,6 +297,52 @@ func (d *DataChannel) readPacket(p *model.Packet) ([]byte, error) {
 
 	// get plaintext payload from the decrypted plaintext
 	return maybeDecompress(plaintext, d.state, d.options)
+}
+
+// decryptWithKeyMaterial decrypts using a specific KeyMaterial.
+func (d *DataChannel) decryptWithKeyMaterial(encrypted []byte, km *KeyMaterial) ([]byte, error) {
+	if d.decryptFn == nil {
+		return nil, ErrInitError
+	}
+
+	// Decode the encrypted payload
+	encryptedData, err := d.decodeEncryptedPayloadWithKeyMaterial(encrypted, km)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrCannotDecrypt, err)
+	}
+	if len(encryptedData.ciphertext) == 0 {
+		return nil, fmt.Errorf("%w: nothing to decrypt", ErrCannotDecrypt)
+	}
+
+	// Get cipher key as a slice
+	cipherKey := km.GetCipherKeyRemote()
+	plainText, err := d.decryptFn(cipherKey[:], encryptedData)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrCannotDecrypt, err)
+	}
+
+	// AEAD mode: check replay AFTER successful decryption/authentication
+	// This follows OpenVPN official behavior (crypto.c:openvpn_decrypt_aead L465)
+	// to prevent attackers from polluting the replay window with forged packets.
+	//
+	// IMPORTANT: Use per-key replay filter (km.CheckReplay) instead of shared filter.
+	// Each key_state in OpenVPN has its own packet_id_rec for replay protection.
+	// Using a shared filter would cause issues during key rotation when packet IDs
+	// from different keys may overlap.
+	if d.state.dataCipher.isAEAD() && encryptedData.packetID != 0 {
+		if err := km.CheckReplay(encryptedData.packetID); err != nil {
+			return nil, err
+		}
+	}
+
+	return plainText, nil
+}
+
+// decodeEncryptedPayloadWithKeyMaterial decodes encrypted data using a specific KeyMaterial's HMAC.
+func (d *DataChannel) decodeEncryptedPayloadWithKeyMaterial(b []byte, km *KeyMaterial) (*encryptedData, error) {
+	// For now, delegate to the existing decoder which uses legacy state fields
+	// TODO: Full multi-key support would require passing KeyMaterial to decode functions
+	return d.decodeFn(d.log, b, d.sessionManager, d.state)
 }
 
 func (d *DataChannel) decrypt(encrypted []byte) ([]byte, error) {
@@ -242,5 +365,20 @@ func (d *DataChannel) decrypt(encrypted []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %s", ErrCannotDecrypt, err)
 	}
+
+	// AEAD mode: check replay AFTER successful decryption/authentication
+	// This follows OpenVPN official behavior (crypto.c:openvpn_decrypt_aead L465)
+	// to prevent attackers from polluting the replay window with forged packets.
+	//
+	// NOTE: This legacy path uses the shared replay filter (d.state.CheckReplay)
+	// because there is no per-key KeyMaterial available. This is acceptable for
+	// backward compatibility with single-key mode, but the multi-key path
+	// (decryptWithKeyMaterial) should be preferred as it uses per-key filters.
+	if d.state.dataCipher.isAEAD() && encryptedData.packetID != 0 {
+		if err := d.state.CheckReplay(encryptedData.packetID); err != nil {
+			return nil, err
+		}
+	}
+
 	return plainText, nil
 }

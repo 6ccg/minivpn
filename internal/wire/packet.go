@@ -27,13 +27,12 @@ var ErrMarshalPacket = errors.New("cannot marshal packet")
 var ErrPacketTooShort = errors.New("openvpn: packet too short")
 
 func MarshalPacket(p *model.Packet, packetAuth *ControlChannelSecurity) ([]byte, error) {
-	buf := &bytes.Buffer{}
-
 	switch p.Opcode {
 	case model.P_DATA_V1, model.P_DATA_V2:
 		// Data packets already include the opcode/key header (and peer-id for v2)
 		// inside the encrypted payload produced by the datachannel.
-		buf.Write(p.Payload)
+		// 直接返回 payload，零拷贝
+		return p.Payload, nil
 	default:
 		// Chunks that of the packet which will be composed in different ways
 		// based on the type of control channel security used
@@ -62,10 +61,15 @@ func MarshalPacket(p *model.Packet, packetAuth *ControlChannelSecurity) ([]byte,
 			log.Printf("[DEBUG-PACKET]   Security mode: %d", packetAuth.Mode)
 		}
 
+		// 预分配 buffer：根据安全模式估算大小
+		// header(9) + replay(8) + digest(最大32) + ctrl + wrappedKey
+		estimatedSize := len(header) + len(replay) + 32 + len(ctrl) + len(packetAuth.WrappedClientKey)
+		buf := make([]byte, 0, estimatedSize)
+
 		switch packetAuth.Mode {
 		case ControlSecurityModeNone:
-			buf.Write(header)
-			buf.Write(ctrl)
+			buf = append(buf, header...)
+			buf = append(buf, ctrl...)
 
 		case ControlSecurityModeTLSAuth:
 			digest := GenerateTLSAuthDigest(packetAuth.TLSAuthDigest, packetAuth.LocalDigestKey, header, replay, ctrl)
@@ -76,10 +80,10 @@ func MarshalPacket(p *model.Packet, packetAuth *ControlChannelSecurity) ([]byte,
 				log.Printf("[DEBUG-PACKET]   HMAC digest: %x", digest)
 			}
 
-			buf.Write(header)
-			buf.Write(digest)
-			buf.Write(replay)
-			buf.Write(ctrl)
+			buf = append(buf, header...)
+			buf = append(buf, digest...)
+			buf = append(buf, replay...)
+			buf = append(buf, ctrl...)
 
 		// Note HMAC header is in a different position than tls-auth
 		case ControlSecurityModeTLSCrypt, ControlSecurityModeTLSCryptV2:
@@ -92,30 +96,28 @@ func MarshalPacket(p *model.Packet, packetAuth *ControlChannelSecurity) ([]byte,
 				return nil, err
 			}
 
-			buf.Write(header)
-			buf.Write(replay)
-			buf.Write(digest[:])
-			buf.Write(enc)
-
+			buf = append(buf, header...)
+			buf = append(buf, replay...)
+			buf = append(buf, digest[:]...)
+			buf = append(buf, enc...)
 		}
 
 		// tls-cryptv2 requires an additional "wrapped client key" to be appended to reset packets
 		// which includes the client key (Kc) encrypted with a server key (not exposed to client) so
 		// that the server can statelessly validate the keys used by the client
 		if packetAuth.Mode == ControlSecurityModeTLSCryptV2 && p.Opcode == model.P_CONTROL_HARD_RESET_CLIENT_V3 {
-			buf.Write(packetAuth.WrappedClientKey) // WKc
+			buf = append(buf, packetAuth.WrappedClientKey...) // WKc
 		}
-	}
 
-	return buf.Bytes(), nil
+		return buf, nil
+	}
 }
 
 // UnmarshalPacket produces a packet after parsing the common header. We assume that
 // the underlying connection has already stripped out the framing.
 func UnmarshalPacket(buf []byte, packetAuth *ControlChannelSecurity) (*model.Packet, error) {
-	// a valid packet is larger, but this allows us
-	// to keep parsing a non-data packet.
-	if len(buf) < 2 {
+	// Minimum 1 byte needed to read opcode (matches OpenVPN's buf->len <= 0 check)
+	if len(buf) < 1 {
 		return nil, ErrPacketTooShort
 	}
 	// parsing opcode and keyID
@@ -288,25 +290,27 @@ func validateTLSCryptDigest(p *model.Packet, key *ControlChannelKey, got SHA256H
 	}
 
 	want := GenerateTLSCryptDigest(key, header, replay, ctrl)
-	return got == want, nil
+	return hmac.Equal(got[:], want[:]), nil
 
 }
 
 func headerBytes(p *model.Packet) []byte {
-	buf := &bytes.Buffer{}
-	buf.WriteByte((byte(p.Opcode) << 3) | (p.KeyID & 0x07))
-	buf.Write(p.LocalSessionID[:])
-	return buf.Bytes()
+	// 固定9字节：1字节opcode/keyID + 8字节sessionID，零分配
+	var buf [9]byte
+	buf[0] = (byte(p.Opcode) << 3) | (p.KeyID & 0x07)
+	copy(buf[1:], p.LocalSessionID[:])
+	return buf[:]
 }
 
 // ReplayProtection refers to (ReplayPacketID, Timestamp)
 // these fields are used by the server to reject packets that have
 // already been processed.
 func replayProtectionBytes(p *model.Packet) []byte {
-	buf := &bytes.Buffer{}
-	bytesx.WriteUint32(buf, uint32(p.ReplayPacketID))
-	bytesx.WriteUint32(buf, uint32(p.Timestamp))
-	return buf.Bytes()
+	// 固定8字节：4字节packetID + 4字节timestamp，零分配
+	var buf [8]byte
+	bytesx.PutUint32(buf[0:4], uint32(p.ReplayPacketID))
+	bytesx.PutUint32(buf[4:8], uint32(p.Timestamp))
+	return buf[:]
 }
 
 func readReplayProtection(p *model.Packet, buf *bytes.Buffer) error {
@@ -331,25 +335,42 @@ func readReplayProtection(p *model.Packet, buf *bytes.Buffer) error {
 // it is also the segment of the packet that is encrypted when tls-crypt(-v2)
 // operation modes are used
 func controlMessageBytes(p *model.Packet) ([]byte, error) {
-	buf := &bytes.Buffer{}
 	nAcks := len(p.ACKs)
 	if nAcks > math.MaxUint8 {
-		return buf.Bytes(), fmt.Errorf("%w: too many ACKs", ErrMarshalPacket)
+		return nil, fmt.Errorf("%w: too many ACKs", ErrMarshalPacket)
 	}
-	buf.WriteByte(byte(nAcks))
+
+	// 预估大小：1(nAcks) + 4*nAcks(ACKs) + 8(RemoteSessionID,仅当有ACK时) + 4(ID) + len(Payload)
+	estimatedSize := 1 + 4*nAcks + 4 + len(p.Payload)
+	if nAcks > 0 {
+		estimatedSize += 8
+	}
+	buf := make([]byte, 0, estimatedSize)
+
+	// ACK count
+	buf = append(buf, byte(nAcks))
+
+	// ACKs
 	for i := 0; i < nAcks; i++ {
-		bytesx.WriteUint32(buf, uint32(p.ACKs[i]))
+		var ackBuf [4]byte
+		bytesx.PutUint32(ackBuf[:], uint32(p.ACKs[i]))
+		buf = append(buf, ackBuf[:]...)
 	}
-	// remote session id
-	if len(p.ACKs) > 0 {
-		buf.Write(p.RemoteSessionID[:])
+
+	// remote session id (only if ACKs present)
+	if nAcks > 0 {
+		buf = append(buf, p.RemoteSessionID[:]...)
 	}
+
+	// packet ID and payload (not for P_ACK_V1)
 	if p.Opcode != model.P_ACK_V1 {
-		// Message-level pet id
-		bytesx.WriteUint32(buf, uint32(p.ID))
-		buf.Write(p.Payload)
+		var idBuf [4]byte
+		bytesx.PutUint32(idBuf[:], uint32(p.ID))
+		buf = append(buf, idBuf[:]...)
+		buf = append(buf, p.Payload...)
 	}
-	return buf.Bytes(), nil
+
+	return buf, nil
 }
 
 func readControlMessage(p *model.Packet, buf *bytes.Buffer) error {

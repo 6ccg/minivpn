@@ -5,7 +5,6 @@ package datachannel
 //
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -29,40 +28,52 @@ func dataOpcode(session *session.Manager) model.Opcode {
 }
 
 // encryptAndEncodePayloadAEAD peforms encryption and encoding of the payload in AEAD modes (i.e., AES-GCM).
-// TODO(ainghazal): for testing we can pass both the state object and the encryptFn
+// Optimized to minimize allocations using scratch buffers.
 func encryptAndEncodePayloadAEAD(log model.Logger, padded []byte, session *session.Manager, state *dataChannelState) ([]byte, error) {
 	nextPacketID, err := session.LocalDataPacketID()
 	if err != nil {
-		return []byte{}, fmt.Errorf("bad packet id")
+		return nil, fmt.Errorf("bad packet id")
 	}
 
+	// Build AEAD header directly into scratch buffer (no allocation)
 	// in AEAD mode, we authenticate:
 	// - 1 byte: opcode/key
 	// - 3 bytes: peer-id (only for P_DATA_V2)
 	// - 4 bytes: packet-id
-	aead := &bytes.Buffer{}
-	aead.WriteByte(opcodeAndKeyHeader(session))
+	aeadLen := 1 + 4 // opcode/key + packet_id
 	if dataOpcode(session) == model.P_DATA_V2 {
-		bytesx.WriteUint24(aead, uint32(session.TunnelInfo().PeerID))
+		aeadLen += 3 // peer_id
 	}
-	bytesx.WriteUint32(aead, uint32(nextPacketID))
 
-	// the iv is the packetID (again) concatenated with the 8 bytes of the
-	// key derived for local hmac (which we do not use for anything else in AEAD mode).
-	iv := &bytes.Buffer{}
-	bytesx.WriteUint32(iv, uint32(nextPacketID))
-	iv.Write(state.hmacKeyLocal[:8])
+	aead := state.scratchAEADLocal[:aeadLen]
+	offset := 0
+	aead[offset] = opcodeAndKeyHeader(session)
+	offset++
+	if dataOpcode(session) == model.P_DATA_V2 {
+		peerID := uint32(session.TunnelInfo().PeerID)
+		aead[offset] = byte(peerID >> 16)
+		aead[offset+1] = byte(peerID >> 8)
+		aead[offset+2] = byte(peerID)
+		offset += 3
+	}
+	binary.BigEndian.PutUint32(aead[offset:], uint32(nextPacketID))
+
+	// Build IV directly into scratch buffer (no allocation)
+	// the iv is the packetID concatenated with 8 bytes of the hmac key
+	iv := state.scratchIVLocal[:]
+	binary.BigEndian.PutUint32(iv[:4], uint32(nextPacketID))
+	copy(iv[4:], state.hmacKeyLocal[:8])
 
 	data := &plaintextData{
-		iv:        iv.Bytes(),
+		iv:        iv,
 		plaintext: padded,
-		aead:      aead.Bytes(),
+		aead:      aead,
 	}
 
 	encryptFn := state.dataCipher.encrypt
 	encrypted, err := encryptFn(state.cipherKeyLocal[:], data)
 	if err != nil {
-		return []byte{}, err
+		return nil, err
 	}
 
 	// some reordering, because openvpn uses tag | payload
@@ -70,19 +81,21 @@ func encryptAndEncodePayloadAEAD(log model.Logger, padded []byte, session *sessi
 	tag := encrypted[boundary:]
 	ciphertext := encrypted[:boundary]
 
-	// we now write to the output buffer
-	out := bytes.Buffer{}
-	out.Write(data.aead) // opcode|peer-id|packet_id
-	out.Write(tag)
-	out.Write(ciphertext)
-	return out.Bytes(), nil
+	// Calculate output size and build result directly (single allocation for result)
+	outputSize := aeadLen + 16 + len(ciphertext)
+	result := make([]byte, outputSize)
+	n := copy(result, aead)
+	n += copy(result[n:], tag)
+	copy(result[n:], ciphertext)
 
+	return result, nil
 }
 
 // assign the random function to allow using a deterministic one in tests.
 var genRandomFn = bytesx.GenRandomBytes
 
 // encryptAndEncodePayloadNonAEAD peforms encryption and encoding of the payload in Non-AEAD modes (i.e., AES-CBC).
+// Optimized to minimize allocations using direct slice operations.
 func encryptAndEncodePayloadNonAEAD(log model.Logger, padded []byte, session *session.Manager, state *dataChannelState) ([]byte, error) {
 	// For iv generation, OpenVPN uses a nonce-based PRNG that is initially seeded with
 	// OpenSSL RAND_bytes function. I am assuming this is good enough for our current purposes.
@@ -109,16 +122,32 @@ func encryptAndEncodePayloadNonAEAD(log model.Logger, padded []byte, session *se
 	state.hmacLocal.Write(ciphertext)
 	computedMAC := state.hmacLocal.Sum(nil)
 
-	out := &bytes.Buffer{}
-	out.WriteByte(opcodeAndKeyHeader(session))
+	// Calculate header size
+	headerSize := 1 // opcode/key
 	if dataOpcode(session) == model.P_DATA_V2 {
-		bytesx.WriteUint24(out, uint32(session.TunnelInfo().PeerID))
+		headerSize += 3 // peer_id
 	}
 
-	out.Write(computedMAC)
-	out.Write(iv)
-	out.Write(ciphertext)
-	return out.Bytes(), nil
+	// Total output: header + MAC + IV + ciphertext (single allocation)
+	outputSize := headerSize + len(computedMAC) + len(iv) + len(ciphertext)
+	result := make([]byte, outputSize)
+
+	// Write directly to result buffer
+	offset := 0
+	result[offset] = opcodeAndKeyHeader(session)
+	offset++
+	if dataOpcode(session) == model.P_DATA_V2 {
+		peerID := uint32(session.TunnelInfo().PeerID)
+		result[offset] = byte(peerID >> 16)
+		result[offset+1] = byte(peerID >> 8)
+		result[offset+2] = byte(peerID)
+		offset += 3
+	}
+	offset += copy(result[offset:], computedMAC)
+	offset += copy(result[offset:], iv)
+	copy(result[offset:], ciphertext)
+
+	return result, nil
 }
 
 // doCompress adds compression bytes if needed by the passed compression options.
@@ -169,15 +198,14 @@ func doPadding(b []byte, compress config.Compression, blockSize uint8) ([]byte, 
 	return padded, nil
 }
 
-// prependPacketID returns the original buffer with the passed packetID
+// prependPacketID returns a new buffer with the passed packetID
 // concatenated at the beginning.
+// Optimized to use single allocation instead of bytes.Buffer + make.
 func prependPacketID(p model.PacketID, buf []byte) []byte {
-	newbuf := &bytes.Buffer{}
-	packetID := make([]byte, 4)
-	binary.BigEndian.PutUint32(packetID, uint32(p))
-	newbuf.Write(packetID[:])
-	newbuf.Write(buf)
-	return newbuf.Bytes()
+	result := make([]byte, 4+len(buf))
+	binary.BigEndian.PutUint32(result[:4], uint32(p))
+	copy(result[4:], buf)
+	return result
 }
 
 // opcodeAndKeyHeader returns the header byte encoding the opcode and keyID (3 upper

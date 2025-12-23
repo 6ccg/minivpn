@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 )
 
 func TestNewOpcodeFromString(t *testing.T) {
@@ -151,7 +152,7 @@ func Test_NewPacket(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if diff := cmp.Diff(NewPacket(tt.args.opcode, tt.args.keyID, tt.args.payload), tt.want); diff != "" {
+			if diff := cmp.Diff(NewPacket(tt.args.opcode, tt.args.keyID, tt.args.payload), tt.want, cmpopts.IgnoreUnexported(Packet{})); diff != "" {
 				t.Errorf(diff)
 			}
 		})

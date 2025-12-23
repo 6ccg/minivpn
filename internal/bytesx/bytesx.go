@@ -84,7 +84,7 @@ func DecodeOptionStringFromBytes(b []byte) (string, error) {
 	if b[length-1] != 0x00 {
 		return "", fmt.Errorf("%w: missing trailing \\0", ErrDecodeOption)
 	}
-	return string(b[:len(b)-1]), nil
+	return string(b[:length-1]), nil
 }
 
 // BytesUnpadPKCS7 performs the PKCS#7 unpadding of a byte array.
@@ -147,6 +147,12 @@ func WriteUint32(buf *bytes.Buffer, val uint32) {
 	var numBuf [4]byte
 	binary.BigEndian.PutUint32(numBuf[:], val)
 	buf.Write(numBuf[:])
+}
+
+// PutUint32 writes a uint32 value to a 4-byte slice in big-endian order.
+// This is a zero-allocation version for direct slice writes.
+func PutUint32(b []byte, val uint32) {
+	binary.BigEndian.PutUint32(b, val)
 }
 
 // WriteUint24 is a convenience function that appends to the given buffer

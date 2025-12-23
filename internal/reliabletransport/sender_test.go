@@ -308,6 +308,7 @@ func Test_reliableSender_OnIncomingPacketSeen(t *testing.T) {
 				logger:            log.Log,
 				inFlight:          tt.fields.inflight,
 				pendingACKsToSend: tt.fields.pendingacks,
+				rtt:               newRTTTracker(),
 			}
 			for _, seen := range tt.args.seen {
 				r.OnIncomingPacketSeen(seen)
@@ -408,6 +409,7 @@ func Test_reliableSender_maybeEvictOrMarkWithHigherACK(t *testing.T) {
 			r := &reliableSender{
 				logger:   log.Log,
 				inFlight: tt.fields.inFlight,
+				rtt:      newRTTTracker(),
 			}
 			r.maybeEvictOrMarkWithHigherACK(tt.args.acked)
 			gotToSend := idSequence(inflightSequence(r.inFlight).readyToSend(t0))
@@ -524,6 +526,7 @@ func Test_reliableSender_shouldWakeupAfterACK(t *testing.T) {
 				logger:            log.Log,
 				inFlight:          tt.fields.inflight,
 				pendingACKsToSend: tt.fields.pendingACKsToSend,
+				rtt:               newRTTTracker(),
 			}
 			got, gotDuration := r.shouldWakeupAfterACK(tt.args.t)
 			if got != tt.want {

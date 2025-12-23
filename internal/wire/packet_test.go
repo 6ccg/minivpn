@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/ooni/minivpn/internal/model"
 )
 
@@ -95,7 +96,7 @@ func Test_ParsePacket(t *testing.T) {
 			name:    "a single byte cannot be parsed as a packet",
 			raw:     "20",
 			want:    nil,
-			wantErr: ErrPacketTooShort,
+			wantErr: ErrEmptyPayload,
 		},
 		{
 			name: "parse minimal control packet",
@@ -159,7 +160,7 @@ func Test_ParsePacket(t *testing.T) {
 			if err != nil {
 				return
 			}
-			if diff := cmp.Diff(p, tt.want); diff != "" {
+			if diff := cmp.Diff(p, tt.want, cmpopts.IgnoreUnexported(model.Packet{})); diff != "" {
 				t.Error(diff)
 			}
 		})

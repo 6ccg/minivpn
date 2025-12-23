@@ -180,6 +180,25 @@ type Packet struct {
 
 	// Payload is the packet's payload.
 	Payload []byte
+
+	// releaseFunc is called by Free() to release the underlying buffer back to the pool.
+	releaseFunc func()
+}
+
+// Free calls the release callback if set, releasing the underlying buffer.
+// This should be called when the packet's payload is no longer needed.
+// Safe to call multiple times; only the first call has effect.
+func (p *Packet) Free() {
+	if p.releaseFunc != nil {
+		p.releaseFunc()
+		p.releaseFunc = nil
+	}
+}
+
+// SetReleaseFunc sets the release callback for this packet.
+// The callback will be invoked by Free() to return the buffer to the pool.
+func (p *Packet) SetReleaseFunc(fn func()) {
+	p.releaseFunc = fn
 }
 
 // ErrPacketTooShort indicates that a packet is too short.

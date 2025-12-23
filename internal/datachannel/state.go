@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	"github.com/ooni/minivpn/internal/model"
+	"github.com/ooni/minivpn/internal/session"
 )
 
 // keySlot holds the different local and remote keys.
@@ -30,8 +31,21 @@ type dataChannelState struct {
 	hash func() hash.Hash
 	mu   sync.Mutex
 
-	// not used at the moment, paving the way for key rotation.
-	// keyID           int
+	// Scratch buffers for zero-allocation packet processing.
+	// Separated into Local (encryption/outgoing) and Remote (decryption/incoming)
+	// to allow concurrent read/write operations without locking.
+	// Local buffers are used by encryptAndEncodePayloadAEAD (moveDownWorker).
+	// Remote buffers are used by decodeEncryptedPayloadAEAD (moveUpWorker).
+	scratchAEADLocal  [8]byte  // opcode(1) + peer_id(3) + packet_id(4) for encryption
+	scratchAEADRemote [8]byte  // opcode(1) + peer_id(3) + packet_id(4) for decryption
+	scratchIVLocal    [12]byte // packet_id(4) + hmac_key(8) for encryption
+	scratchIVRemote   [12]byte // packet_id(4) + hmac_key(8) for decryption
+	scratchOutput     []byte   // reusable output buffer, grown as needed
+
+	// Multi-key slot support for key rotation (lame duck handling).
+	// Each slot holds a KeyMaterial with its own replay filter.
+	keys       [session.KS_SIZE]*KeyMaterial
+	activeSlot int // which slot is used for encryption (always KS_PRIMARY)
 }
 
 // initReplayFilter initializes the replay filter with the appropriate mode.
@@ -44,11 +58,14 @@ func (dcs *dataChannelState) initReplayFilter(backtrackMode bool) {
 
 // CheckReplay tests whether a packet ID should be accepted or rejected.
 // Returns nil if the packet is valid, ErrReplayAttack if it's a replay.
+// Note: replayFilter should be initialized via initReplayFilter during DataChannel creation.
 func (dcs *dataChannelState) CheckReplay(id model.PacketID) error {
 	dcs.mu.Lock()
 	defer dcs.mu.Unlock()
 	if dcs.replayFilter == nil {
-		// Lazy initialization with backtrack mode (UDP-safe default)
+		// Fallback lazy initialization with backtrack mode (UDP-safe default).
+		// This should not happen in normal operation as initReplayFilter
+		// is called during DataChannel creation.
 		dcs.replayFilter = newReplayFilter(DefaultSeqBacktrack, true)
 	}
 	return dcs.replayFilter.Check(id)
@@ -84,4 +101,58 @@ func (dcs *dataChannelState) setInitialPacketIDForTest(maxID model.PacketID) {
 	for i := model.PacketID(1); i <= maxID; i++ {
 		dcs.replayFilter.Check(i)
 	}
+}
+
+// GetKeyMaterialByID finds the KeyMaterial matching the given key ID.
+// Returns the KeyMaterial and its slot index, or nil and -1 if not found.
+func (dcs *dataChannelState) GetKeyMaterialByID(keyID uint8) (*KeyMaterial, int) {
+	dcs.mu.Lock()
+	defer dcs.mu.Unlock()
+	for i := 0; i < session.KS_SIZE; i++ {
+		km := dcs.keys[i]
+		if km != nil && km.Ready() && km.KeyID() == keyID {
+			return km, i
+		}
+	}
+	return nil, -1
+}
+
+// SetKeyMaterial sets the KeyMaterial for the given slot.
+func (dcs *dataChannelState) SetKeyMaterial(slot int, km *KeyMaterial) {
+	if slot < 0 || slot >= session.KS_SIZE {
+		return
+	}
+	dcs.mu.Lock()
+	defer dcs.mu.Unlock()
+	dcs.keys[slot] = km
+}
+
+// ClearSlot clears the KeyMaterial at the given slot.
+func (dcs *dataChannelState) ClearSlot(slot int) {
+	if slot < 0 || slot >= session.KS_SIZE {
+		return
+	}
+	dcs.mu.Lock()
+	defer dcs.mu.Unlock()
+	if dcs.keys[slot] != nil {
+		dcs.keys[slot].Clear()
+		dcs.keys[slot] = nil
+	}
+}
+
+// ActiveKeyMaterial returns the active (primary) KeyMaterial used for encryption.
+func (dcs *dataChannelState) ActiveKeyMaterial() *KeyMaterial {
+	dcs.mu.Lock()
+	defer dcs.mu.Unlock()
+	return dcs.keys[dcs.activeSlot]
+}
+
+// KeyMaterialAt returns the KeyMaterial at the given slot index.
+func (dcs *dataChannelState) KeyMaterialAt(slot int) *KeyMaterial {
+	if slot < 0 || slot >= session.KS_SIZE {
+		return nil
+	}
+	dcs.mu.Lock()
+	defer dcs.mu.Unlock()
+	return dcs.keys[slot]
 }

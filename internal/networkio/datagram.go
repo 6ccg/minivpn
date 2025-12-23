@@ -3,6 +3,8 @@ package networkio
 import (
 	"math"
 	"net"
+
+	"github.com/ooni/minivpn/internal/bytespool"
 )
 
 // datagramConn wraps a datagram socket and implements OpenVPN framing.
@@ -13,7 +15,9 @@ type datagramConn struct {
 
 var _ FramingConn = &datagramConn{}
 
-// ReadRawPacket implements FramingConn
+// ReadRawPacket implements FramingConn.
+// The returned buffer is from the pool and must be returned via bytespool.Default.Put()
+// after processing, or by calling Free() on the associated Packet.
 func (c *datagramConn) ReadRawPacket() ([]byte, error) {
 	if c.scratch == nil {
 		// maximum UDP datagram size
@@ -23,9 +27,9 @@ func (c *datagramConn) ReadRawPacket() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Return a right-sized copy to avoid retaining a 64KiB backing array for
-	// small packets and reduce GC pressure.
-	pkt := make([]byte, count)
+	// Get right-sized buffer from pool to avoid retaining a 64KiB backing array
+	// for small packets and reduce GC pressure.
+	pkt := bytespool.Default.Get(count)
 	copy(pkt, c.scratch[:count])
 	return pkt, nil
 }

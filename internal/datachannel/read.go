@@ -1,13 +1,11 @@
 package datachannel
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"encoding/binary"
 	"errors"
 	"fmt"
 
-	"github.com/ooni/minivpn/internal/bytesx"
 	"github.com/ooni/minivpn/internal/model"
 	"github.com/ooni/minivpn/internal/runtimex"
 	"github.com/ooni/minivpn/internal/session"
@@ -37,40 +35,56 @@ func decodeEncryptedPayloadAEAD(log model.Logger, buf []byte, session *session.M
 		return &encryptedData{}, ErrBadRemoteHMAC
 	}
 
-	// Extract and validate packet_id for replay protection
-	// This is done BEFORE decryption as the packet_id is in the authenticated header
+	// Extract packet_id for replay protection
+	// Note: replay check is performed AFTER successful decryption, following
+	// OpenVPN official behavior (crypto.c:openvpn_decrypt_aead L465).
+	// This prevents attackers from polluting the replay window with forged packets.
 	packet_id := buf[:4]
 	packetID := model.PacketID(binary.BigEndian.Uint32(packet_id))
 
-	// Check for replay attack using sliding window
-	if err := state.CheckReplay(packetID); err != nil {
-		return &encryptedData{}, err
-	}
-
 	remoteHMAC := state.hmacKeyRemote[:8]
 
-	headers := &bytes.Buffer{}
-	headers.WriteByte(opcodeAndKeyHeader(session))
+	// Build headers directly into scratch buffer (no allocation)
+	headerLen := 1 + 4 // opcode/key + packet_id
 	if dataOpcode(session) == model.P_DATA_V2 {
-		bytesx.WriteUint24(headers, uint32(session.TunnelInfo().PeerID))
+		headerLen += 3 // peer_id
 	}
-	headers.Write(packet_id)
 
-	// we need to swap because decryption expects payload|tag
-	// but we've got tag | payload instead
-	payload := &bytes.Buffer{}
-	payload.Write(buf[20:])  // ciphertext
-	payload.Write(buf[4:20]) // tag
+	headers := state.scratchAEADRemote[:headerLen]
+	offset := 0
+	headers[offset] = opcodeAndKeyHeader(session)
+	offset++
+	if dataOpcode(session) == model.P_DATA_V2 {
+		peerID := uint32(session.TunnelInfo().PeerID)
+		headers[offset] = byte(peerID >> 16)
+		headers[offset+1] = byte(peerID >> 8)
+		headers[offset+2] = byte(peerID)
+		offset += 3
+	}
+	copy(headers[offset:], packet_id)
 
+	// Swap tag|payload -> payload|tag using pooled buffer
+	// ciphertext starts at buf[20:], tag is at buf[4:20]
+	ciphertextLen := len(buf) - 20
+	payloadLen := ciphertextLen + 16 // ciphertext + tag
+
+	// Use slice pool for payload buffer
+	payload := defaultSlicePool.getSlice(payloadLen)
+	copy(payload[:ciphertextLen], buf[20:])  // ciphertext
+	copy(payload[ciphertextLen:], buf[4:20]) // tag
+
+	// Build IV directly into scratch buffer (no allocation)
 	// iv := packetID | remoteHMAC
-	iv := &bytes.Buffer{}
-	iv.Write(packet_id)
-	iv.Write(remoteHMAC)
+	iv := state.scratchIVRemote[:]
+	copy(iv[:4], packet_id)
+	copy(iv[4:], remoteHMAC)
 
+	// Note: caller must return payload to pool after decryption via defaultSlicePool.putSlice()
 	encrypted := &encryptedData{
-		iv:         iv.Bytes(),
-		ciphertext: payload.Bytes(),
-		aead:       headers.Bytes(),
+		iv:         iv,
+		ciphertext: payload,
+		aead:       headers,
+		packetID:   packetID, // For replay check after successful decryption
 	}
 	return encrypted, nil
 }

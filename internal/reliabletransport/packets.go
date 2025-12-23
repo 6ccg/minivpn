@@ -20,6 +20,9 @@ type inFlightPacket struct {
 
 	// retries is a monotonically increasing counter for retransmission.
 	retries int
+
+	// sentAt records when this packet was first sent, used for RTT calculation.
+	sentAt time.Time
 }
 
 func newInFlightPacket(p *model.Packet) *inFlightPacket {
@@ -37,6 +40,10 @@ func (p *inFlightPacket) ACKForHigherPacket() {
 }
 
 func (p *inFlightPacket) ScheduleForRetransmission(t time.Time) {
+	// Only record sentAt on the first transmission (for RTT calculation)
+	if p.retries == 0 {
+		p.sentAt = t
+	}
 	p.retries++
 	p.deadline = t.Add(p.backoff())
 }

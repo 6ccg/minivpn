@@ -44,6 +44,6 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (Fram
 	case "udp", "udp4", "udp6":
 		return &datagramConn{Conn: conn}, nil
 	default:
-		return &streamConn{conn}, nil
+		return &streamConn{Conn: conn}, nil
 	}
 }

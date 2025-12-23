@@ -138,6 +138,30 @@ func Test_DecodeOptionStringFromBytes(t *testing.T) {
 		},
 		want:    "aaaaa",
 		wantErr: nil,
+	}, {
+		name: "with valid string and trailing padding",
+		args: args{
+			b: []byte{
+				0x00, 0x06,                   // length = 6
+				0x68, 0x65, 0x6c, 0x6c, 0x6f, // "hello"
+				0x00,                   // trailing zero
+				0xAB, 0xCD, 0xEF, 0x00, // padding/extra bytes
+			},
+		},
+		want:    "hello",
+		wantErr: nil,
+	}, {
+		name: "with padding containing printable chars",
+		args: args{
+			b: []byte{
+				0x00, 0x04,       // length = 4
+				0x66, 0x6f, 0x6f, // "foo"
+				0x00,             // trailing zero
+				0x62, 0x61, 0x72, // "bar" as padding (should be ignored)
+			},
+		},
+		want:    "foo",
+		wantErr: nil,
 	}}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

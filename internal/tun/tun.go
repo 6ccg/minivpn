@@ -129,8 +129,8 @@ func newTUN(logger model.Logger, conn networkio.FramingConn, session *session.Ma
 		readBuffer:   &bytes.Buffer{},
 		readDeadline: makeTUNDeadline(),
 		session:      session,
-		tunDown:      make(chan []byte),
-		tunUp:        make(chan []byte),
+		tunDown:      make(chan []byte, tunBuffer),
+		tunUp:        make(chan []byte, tunBuffer),
 		// this function is explicitely set empty so that we can safely use a callback even if not set.
 		whenDoneFn:    func() {},
 		writeDeadline: makeTUNDeadline(),

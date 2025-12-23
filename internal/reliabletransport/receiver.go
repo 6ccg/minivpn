@@ -58,9 +58,11 @@ func (ws *workersState) moveUpWorker() {
 
 			// notify seen packet to the sender using the lateral channel.
 			seen := receiver.newIncomingPacketSeen(packet)
-			ws.incomingSeen <- seen
-
-			// TODO(ainghazal): drop a packet that is a replay (id <= lastConsumed, but != ACK...?)
+			select {
+			case ws.incomingSeen <- seen:
+			case <-ws.workersManager.ShouldShutdown():
+				return
+			}
 
 			// we only want to insert control packets going to the tls layer
 			if packet.Opcode != model.P_CONTROL_V1 {
@@ -157,7 +159,23 @@ func newReliableReceiver(logger model.Logger, ch chan incomingPacketSeen) *relia
 }
 
 func (r *reliableReceiver) MaybeInsertIncoming(p *model.Packet) bool {
-	// we drop if at capacity, by default double the size of the outgoing buffer
+	// Check 1: drop replay packets (already consumed)
+	// This matches OpenVPN's reliable_not_replay() check: id < packet_id
+	if p.ID <= r.lastConsumed {
+		r.logger.Debugf("dropping replay packet: id=%d <= lastConsumed=%d", p.ID, r.lastConsumed)
+		return false
+	}
+
+	// Check 2: drop duplicate packets (already in buffer)
+	// This matches OpenVPN's reliable_not_replay() check for active entries
+	for _, existing := range r.incomingPackets {
+		if existing.ID == p.ID {
+			r.logger.Debugf("dropping duplicate packet: id=%d", p.ID)
+			return false
+		}
+	}
+
+	// Check 3: drop if at capacity
 	if len(r.incomingPackets) >= RELIABLE_RECV_BUFFER_SIZE {
 		r.logger.Warnf("dropping packet, buffer full with len %v", len(r.incomingPackets))
 		return false

@@ -60,7 +60,7 @@ func encodeClientControlMessageAsBytes(k *session.KeySource, o *config.OpenVPNOp
 var controlMessageHeader = []byte{0x00, 0x00, 0x00, 0x00}
 
 const ivVer = "2.5.5" // OpenVPN version compat that we declare to the server
-const ivProto = "8094"  // IV_PROTO: 2(TLS_KEY_EXPORT) + 4(REQUEST_PUSH) + 8(NCP_P2P) + 16(DNS_OPTION)
+const ivProto = "6"   // IV_PROTO: DATA_V2 (2) + REQUEST_PUSH (4) - compatible with OpenVPN 2.4/2.5
 
 // errMissingHeader indicates that we're missing the four-byte all-zero header.
 var errMissingHeader = errors.New("missing four-byte all-zero header")

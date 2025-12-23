@@ -59,13 +59,17 @@ func Test_decodeEncryptedPayloadAEAD(t *testing.T) {
 				iv:         goodDecodeIV,
 				ciphertext: goodDecodeCipherText,
 				aead:       goodDecodeAEAD,
+				packetID:   1, // packet_id is now stored for later replay check
 			},
 			nil,
 		},
+		// Note: packet_id zero rejection is now tested in decrypt() after AEAD verification,
+		// following OpenVPN official behavior (crypto.c:openvpn_decrypt_aead L465).
+		// This prevents attackers from polluting the replay window with forged packets.
 		{
-			"packet_id zero should be rejected",
+			"packet_id zero should be stored (replay check happens after decryption)",
 			args{
-				// packet_id = 0 is invalid
+				// packet_id = 0 is now stored, replay check happens after decryption
 				func() []byte {
 					p, _ := hex.DecodeString("00000000b3653a842f2b8a148de26375218fb01d31278ff328ff2fc65c4dbf9eb8e67766")
 					return p
@@ -73,8 +77,13 @@ func Test_decodeEncryptedPayloadAEAD(t *testing.T) {
 				makeTestingSession(),
 				makeTestingStateAEAD(),
 			},
-			&encryptedData{},
-			ErrReplayAttack,
+			&encryptedData{
+				iv:         func() []byte { b, _ := hex.DecodeString("000000006868686868686868"); return b }(),
+				ciphertext: goodDecodeCipherText,
+				aead:       func() []byte { b, _ := hex.DecodeString("4800000000000000"); return b }(),
+				packetID:   0, // packet_id is stored, will be checked after decryption
+			},
+			nil, // No error at decode stage
 		},
 	}
 	for _, tt := range tests {

@@ -978,3 +978,731 @@ func TestOpenVPNOptions_HasAuthInfo(t *testing.T) {
 		}
 	})
 }
+
+func Test_parseRenegSec(t *testing.T) {
+	t.Run("empty args should fail", func(t *testing.T) {
+		_, err := parseRenegSec([]string{}, &OpenVPNOptions{})
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseRenegSec(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("too many args should fail", func(t *testing.T) {
+		_, err := parseRenegSec([]string{"3600", "2700", "extra"}, &OpenVPNOptions{})
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseRenegSec(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("negative value should fail", func(t *testing.T) {
+		_, err := parseRenegSec([]string{"-1"}, &OpenVPNOptions{})
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseRenegSec(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("non-numeric value should fail", func(t *testing.T) {
+		_, err := parseRenegSec([]string{"abc"}, &OpenVPNOptions{})
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseRenegSec(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("valid value should succeed", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseRenegSec([]string{"3600"}, opt)
+		if err != nil {
+			t.Errorf("parseRenegSec(): want %v, got %v", nil, err)
+		}
+		if o.RenegotiateSeconds != 3600 {
+			t.Errorf("parseRenegSec(): expected RenegotiateSeconds=3600, got %d", o.RenegotiateSeconds)
+		}
+	})
+
+	t.Run("zero value should succeed (disables renegotiation)", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseRenegSec([]string{"0"}, opt)
+		if err != nil {
+			t.Errorf("parseRenegSec(): want %v, got %v", nil, err)
+		}
+		if o.RenegotiateSeconds != 0 {
+			t.Errorf("parseRenegSec(): expected RenegotiateSeconds=0, got %d", o.RenegotiateSeconds)
+		}
+	})
+
+	t.Run("two values should succeed (min is ignored)", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseRenegSec([]string{"3600", "2700"}, opt)
+		if err != nil {
+			t.Errorf("parseRenegSec(): want %v, got %v", nil, err)
+		}
+		if o.RenegotiateSeconds != 3600 {
+			t.Errorf("parseRenegSec(): expected RenegotiateSeconds=3600, got %d", o.RenegotiateSeconds)
+		}
+	})
+}
+
+func Test_parseRenegBytes(t *testing.T) {
+	t.Run("empty args should fail", func(t *testing.T) {
+		_, err := parseRenegBytes([]string{}, &OpenVPNOptions{})
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseRenegBytes(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("too many args should fail", func(t *testing.T) {
+		_, err := parseRenegBytes([]string{"1000000", "extra"}, &OpenVPNOptions{})
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseRenegBytes(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("negative value should fail", func(t *testing.T) {
+		_, err := parseRenegBytes([]string{"-100"}, &OpenVPNOptions{})
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseRenegBytes(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("non-numeric value should fail", func(t *testing.T) {
+		_, err := parseRenegBytes([]string{"abc"}, &OpenVPNOptions{})
+		wantErr := ErrBadConfig
+		if !errors.Is(err, wantErr) {
+			t.Errorf("parseRenegBytes(): want %v, got %v", wantErr, err)
+		}
+	})
+
+	t.Run("valid value should succeed", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseRenegBytes([]string{"67108864"}, opt)
+		if err != nil {
+			t.Errorf("parseRenegBytes(): want %v, got %v", nil, err)
+		}
+		if o.RenegotiateBytes != 67108864 {
+			t.Errorf("parseRenegBytes(): expected RenegotiateBytes=67108864, got %d", o.RenegotiateBytes)
+		}
+	})
+
+	t.Run("zero value should succeed (disables renegotiation)", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		o, err := parseRenegBytes([]string{"0"}, opt)
+		if err != nil {
+			t.Errorf("parseRenegBytes(): want %v, got %v", nil, err)
+		}
+		if o.RenegotiateBytes != 0 {
+			t.Errorf("parseRenegBytes(): expected RenegotiateBytes=0, got %d", o.RenegotiateBytes)
+		}
+	})
+}
+
+func TestRenegotiationDefaults(t *testing.T) {
+	t.Run("default renegotiation values are set correctly", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.RenegotiateSeconds != DefaultRenegotiateSeconds {
+			t.Errorf("expected default RenegotiateSeconds=%d, got %d", DefaultRenegotiateSeconds, opt.RenegotiateSeconds)
+		}
+		if opt.RenegotiateBytes != DefaultRenegotiateBytes {
+			t.Errorf("expected default RenegotiateBytes=%d, got %d", DefaultRenegotiateBytes, opt.RenegotiateBytes)
+		}
+	})
+
+	t.Run("reneg-sec is parsed from config", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"reneg-sec 7200",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.RenegotiateSeconds != 7200 {
+			t.Errorf("expected RenegotiateSeconds=7200, got %d", opt.RenegotiateSeconds)
+		}
+	})
+
+	t.Run("reneg-bytes is parsed from config", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"reneg-bytes 67108864",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.RenegotiateBytes != 67108864 {
+			t.Errorf("expected RenegotiateBytes=67108864, got %d", opt.RenegotiateBytes)
+		}
+	})
+
+	t.Run("reneg-sec 0 disables time-based renegotiation", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"reneg-sec 0",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.RenegotiateSeconds != 0 {
+			t.Errorf("expected RenegotiateSeconds=0, got %d", opt.RenegotiateSeconds)
+		}
+	})
+}
+
+func TestPingDefaults(t *testing.T) {
+	t.Run("ping options default to 0 (disabled)", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.Ping != 0 {
+			t.Errorf("expected Ping=0, got %d", opt.Ping)
+		}
+		if opt.PingRestart != 0 {
+			t.Errorf("expected PingRestart=0, got %d", opt.PingRestart)
+		}
+		if opt.PingExit != 0 {
+			t.Errorf("expected PingExit=0, got %d", opt.PingExit)
+		}
+	})
+
+	t.Run("ping is parsed from config", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"ping 15",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.Ping != 15 {
+			t.Errorf("expected Ping=15, got %d", opt.Ping)
+		}
+	})
+
+	t.Run("ping-restart is parsed from config", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"ping-restart 60",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.PingRestart != 60 {
+			t.Errorf("expected PingRestart=60, got %d", opt.PingRestart)
+		}
+	})
+
+	t.Run("ping-exit is parsed from config", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"ping-exit 120",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.PingExit != 120 {
+			t.Errorf("expected PingExit=120, got %d", opt.PingExit)
+		}
+	})
+
+	t.Run("keepalive sets ping and ping-restart", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"keepalive 10 60",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Errorf("getOptionsFromLines: %v", err)
+		}
+		if opt.Ping != 10 {
+			t.Errorf("expected Ping=10, got %d", opt.Ping)
+		}
+		if opt.PingRestart != 60 {
+			t.Errorf("expected PingRestart=60, got %d", opt.PingRestart)
+		}
+	})
+
+	t.Run("invalid ping value returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"ping abc",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for invalid ping value")
+		}
+	})
+
+	t.Run("negative ping value returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"ping -1",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for negative ping value")
+		}
+	})
+
+	t.Run("keepalive with wrong arg count returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"keepalive 10",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for keepalive with one arg")
+		}
+	})
+}
+
+func TestHandshakeWindowDefaults(t *testing.T) {
+	t.Run("hand-window defaults to 60 seconds", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.HandshakeWindow != DefaultHandshakeWindow {
+			t.Errorf("expected default HandshakeWindow=%d, got %d", DefaultHandshakeWindow, opt.HandshakeWindow)
+		}
+	})
+
+	t.Run("hand-window is parsed from config", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"hand-window 120",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.HandshakeWindow != 120 {
+			t.Errorf("expected HandshakeWindow=120, got %d", opt.HandshakeWindow)
+		}
+	})
+
+	t.Run("hand-window 0 is valid", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"hand-window 0",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.HandshakeWindow != 0 {
+			t.Errorf("expected HandshakeWindow=0, got %d", opt.HandshakeWindow)
+		}
+	})
+
+	t.Run("invalid hand-window value returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"hand-window abc",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for invalid hand-window value")
+		}
+	})
+
+	t.Run("negative hand-window value returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"hand-window -1",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for negative hand-window value")
+		}
+	})
+
+	t.Run("hand-window missing arg returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"hand-window",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for hand-window with no arg")
+		}
+	})
+}
+
+func TestVerifyX509NameParsing(t *testing.T) {
+	t.Run("verify-x509-name with name only (default type=subject)", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"verify-x509-name Server-1",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.VerifyX509Name != "Server-1" {
+			t.Errorf("expected VerifyX509Name=Server-1, got %q", opt.VerifyX509Name)
+		}
+		if opt.VerifyX509Type != VerifyX509SubjectDN {
+			t.Errorf("expected VerifyX509Type=VerifyX509SubjectDN, got %d", opt.VerifyX509Type)
+		}
+	})
+
+	t.Run("verify-x509-name with subject type", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"verify-x509-name C=KG,ST=NA,CN=Server subject",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.VerifyX509Name != "C=KG,ST=NA,CN=Server" {
+			t.Errorf("expected VerifyX509Name=C=KG,ST=NA,CN=Server, got %q", opt.VerifyX509Name)
+		}
+		if opt.VerifyX509Type != VerifyX509SubjectDN {
+			t.Errorf("expected VerifyX509Type=VerifyX509SubjectDN, got %d", opt.VerifyX509Type)
+		}
+	})
+
+	t.Run("verify-x509-name with name type (CN match)", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"verify-x509-name MyServer name",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.VerifyX509Name != "MyServer" {
+			t.Errorf("expected VerifyX509Name=MyServer, got %q", opt.VerifyX509Name)
+		}
+		if opt.VerifyX509Type != VerifyX509SubjectRDN {
+			t.Errorf("expected VerifyX509Type=VerifyX509SubjectRDN, got %d", opt.VerifyX509Type)
+		}
+	})
+
+	t.Run("verify-x509-name with name-prefix type", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"verify-x509-name Server- name-prefix",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.VerifyX509Name != "Server-" {
+			t.Errorf("expected VerifyX509Name=Server-, got %q", opt.VerifyX509Name)
+		}
+		if opt.VerifyX509Type != VerifyX509SubjectRDNPrefix {
+			t.Errorf("expected VerifyX509Type=VerifyX509SubjectRDNPrefix, got %d", opt.VerifyX509Type)
+		}
+	})
+
+	t.Run("verify-x509-name type is case-insensitive", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"verify-x509-name Server NAME",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.VerifyX509Type != VerifyX509SubjectRDN {
+			t.Errorf("expected VerifyX509Type=VerifyX509SubjectRDN, got %d", opt.VerifyX509Type)
+		}
+	})
+
+	t.Run("verify-x509-name with unknown type returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"verify-x509-name Server unknown-type",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for unknown verify-x509-name type")
+		}
+	})
+
+	t.Run("verify-x509-name with empty name returns error", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseVerifyX509Name([]string{""}, opt)
+		if err == nil {
+			t.Error("expected error for empty name")
+		}
+	})
+
+	t.Run("verify-x509-name with no args returns error", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseVerifyX509Name([]string{}, opt)
+		if err == nil {
+			t.Error("expected error for no args")
+		}
+	})
+
+	t.Run("verify-x509-name with too many args returns error", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseVerifyX509Name([]string{"name", "type", "extra"}, opt)
+		if err == nil {
+			t.Error("expected error for too many args")
+		}
+	})
+
+	t.Run("default verify-x509-name is empty (no verification)", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.VerifyX509Name != "" {
+			t.Errorf("expected empty VerifyX509Name, got %q", opt.VerifyX509Name)
+		}
+		if opt.VerifyX509Type != VerifyX509None {
+			t.Errorf("expected VerifyX509Type=VerifyX509None, got %d", opt.VerifyX509Type)
+		}
+	})
+}
+
+func TestRemoteCertKUParsing(t *testing.T) {
+	t.Run("remote-cert-ku with single hex value", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-ku 80",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 1 {
+			t.Fatalf("expected 1 RemoteCertKU, got %d", len(opt.RemoteCertKU))
+		}
+		if opt.RemoteCertKU[0] != KeyUsage(0x80) {
+			t.Errorf("expected RemoteCertKU[0]=0x80, got 0x%x", opt.RemoteCertKU[0])
+		}
+	})
+
+	t.Run("remote-cert-ku with multiple hex values", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-ku 80 a0 88",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 3 {
+			t.Fatalf("expected 3 RemoteCertKU values, got %d", len(opt.RemoteCertKU))
+		}
+		expected := []KeyUsage{0x80, 0xa0, 0x88}
+		for i, exp := range expected {
+			if opt.RemoteCertKU[i] != exp {
+				t.Errorf("expected RemoteCertKU[%d]=0x%x, got 0x%x", i, exp, opt.RemoteCertKU[i])
+			}
+		}
+	})
+
+	t.Run("remote-cert-ku with uppercase hex", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-ku A0 FF",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 2 {
+			t.Fatalf("expected 2 RemoteCertKU values, got %d", len(opt.RemoteCertKU))
+		}
+		if opt.RemoteCertKU[0] != KeyUsage(0xA0) {
+			t.Errorf("expected RemoteCertKU[0]=0xA0, got 0x%x", opt.RemoteCertKU[0])
+		}
+		if opt.RemoteCertKU[1] != KeyUsage(0xFF) {
+			t.Errorf("expected RemoteCertKU[1]=0xFF, got 0x%x", opt.RemoteCertKU[1])
+		}
+	})
+
+	t.Run("remote-cert-ku with invalid hex returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-ku xyz",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for invalid hex in remote-cert-ku")
+		}
+	})
+
+	t.Run("remote-cert-ku with no args returns error", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseRemoteCertKU([]string{}, opt)
+		if err == nil {
+			t.Error("expected error for remote-cert-ku with no args")
+		}
+	})
+
+	t.Run("default remote-cert-ku is empty", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 0 {
+			t.Errorf("expected empty RemoteCertKU, got %v", opt.RemoteCertKU)
+		}
+	})
+}
+
+func TestRemoteCertEKUParsing(t *testing.T) {
+	t.Run("remote-cert-eku with OID", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-eku 1.3.6.1.5.5.7.3.1",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.RemoteCertEKU != "1.3.6.1.5.5.7.3.1" {
+			t.Errorf("expected RemoteCertEKU=1.3.6.1.5.5.7.3.1, got %q", opt.RemoteCertEKU)
+		}
+	})
+
+	t.Run("remote-cert-eku with name", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-eku serverAuth",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.RemoteCertEKU != "serverAuth" {
+			t.Errorf("expected RemoteCertEKU=serverAuth, got %q", opt.RemoteCertEKU)
+		}
+	})
+
+	t.Run("remote-cert-eku with no args returns error", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseRemoteCertEKU([]string{}, opt)
+		if err == nil {
+			t.Error("expected error for remote-cert-eku with no args")
+		}
+	})
+
+	t.Run("remote-cert-eku with too many args returns error", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseRemoteCertEKU([]string{"oid1", "oid2"}, opt)
+		if err == nil {
+			t.Error("expected error for remote-cert-eku with too many args")
+		}
+	})
+
+	t.Run("default remote-cert-eku is empty", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.RemoteCertEKU != "" {
+			t.Errorf("expected empty RemoteCertEKU, got %q", opt.RemoteCertEKU)
+		}
+	})
+}
+
+func TestRemoteCertTLSParsing(t *testing.T) {
+	t.Run("remote-cert-tls server sets EKU to serverAuth", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-tls server",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.RemoteCertEKU != "serverAuth" {
+			t.Errorf("expected RemoteCertEKU=serverAuth, got %q", opt.RemoteCertEKU)
+		}
+	})
+
+	t.Run("remote-cert-tls client sets EKU to clientAuth", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-tls client",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.RemoteCertEKU != "clientAuth" {
+			t.Errorf("expected RemoteCertEKU=clientAuth, got %q", opt.RemoteCertEKU)
+		}
+	})
+
+	t.Run("remote-cert-tls is case-insensitive", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-tls SERVER",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.RemoteCertEKU != "serverAuth" {
+			t.Errorf("expected RemoteCertEKU=serverAuth, got %q", opt.RemoteCertEKU)
+		}
+	})
+
+	t.Run("remote-cert-tls with invalid type returns error", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-tls invalid",
+		}
+		_, err := getOptionsFromLines(l, t.TempDir())
+		if err == nil {
+			t.Error("expected error for invalid remote-cert-tls type")
+		}
+	})
+
+	t.Run("remote-cert-tls with no args returns error", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseRemoteCertTLS([]string{}, opt)
+		if err == nil {
+			t.Error("expected error for remote-cert-tls with no args")
+		}
+	})
+
+	t.Run("remote-cert-tls with too many args returns error", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseRemoteCertTLS([]string{"server", "extra"}, opt)
+		if err == nil {
+			t.Error("expected error for remote-cert-tls with too many args")
+		}
+	})
+}

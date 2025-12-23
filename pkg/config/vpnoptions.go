@@ -41,6 +41,11 @@ func (p Proto) String() string {
 	return string(p)
 }
 
+// IsTCP returns true if the protocol is TCP-based (tcp, tcp4, tcp6).
+func (p Proto) IsTCP() bool {
+	return p == ProtoTCP || p == ProtoTCP4 || p == ProtoTCP6
+}
+
 const (
 	// ProtoTCP is used for vpn in TCP mode (dual-stack).
 	ProtoTCP = Proto("tcp")
@@ -80,6 +85,63 @@ var SupportedAuth = []string{
 	"SHA512",
 }
 
+// Default values for renegotiation options (matching OpenVPN 2.5 defaults)
+const (
+	// DefaultRenegotiateSeconds is the default time after which to renegotiate keys (1 hour).
+	DefaultRenegotiateSeconds = 3600
+
+	// DefaultRenegotiateBytes is -1 meaning disabled by default.
+	// Exception: for ciphers with block sizes < 128 bits, OpenVPN sets this to 64MB.
+	DefaultRenegotiateBytes = -1
+
+	// DefaultTransitionWindow is how long (seconds) a lame duck key stays alive
+	// after a soft reset. This corresponds to OpenVPN's --transition-window option.
+	DefaultTransitionWindow = 60
+
+	// DefaultHandshakeWindow is the default time in seconds within which the TLS handshake
+	// must complete (including PUSH_REPLY). Corresponds to OpenVPN's --hand-window option.
+	DefaultHandshakeWindow = 60
+
+	// PushRequestInterval is the interval in seconds between PUSH_REQUEST retries.
+	// This matches OpenVPN's PUSH_REQUEST_INTERVAL constant in common.h.
+	PushRequestInterval = 5
+)
+
+// VerifyX509Type specifies how to verify the server certificate's X.509 name.
+// Corresponds to OpenVPN's --verify-x509-name option.
+type VerifyX509Type int
+
+const (
+	// VerifyX509None means no X.509 name verification (default).
+	VerifyX509None VerifyX509Type = iota
+
+	// VerifyX509SubjectDN matches the complete Subject Distinguished Name.
+	VerifyX509SubjectDN
+
+	// VerifyX509SubjectRDN matches a Subject Relative Distinguished Name (typically CN).
+	VerifyX509SubjectRDN
+
+	// VerifyX509SubjectRDNPrefix matches a prefix of the Subject RDN.
+	VerifyX509SubjectRDNPrefix
+)
+
+// KeyUsage represents X.509 Key Usage flags.
+// These correspond to the bits in the Key Usage extension (RFC 5280).
+type KeyUsage uint16
+
+const (
+	// Key Usage bit flags (matching OpenVPN's definitions from ssl_verify.h)
+	KeyUsageDigitalSignature KeyUsage = 1 << 0 // 0x0001
+	KeyUsageNonRepudiation   KeyUsage = 1 << 1 // 0x0002
+	KeyUsageKeyEncipherment  KeyUsage = 1 << 2 // 0x0004
+	KeyUsageDataEncipherment KeyUsage = 1 << 3 // 0x0008
+	KeyUsageKeyAgreement     KeyUsage = 1 << 4 // 0x0010
+	KeyUsageKeyCertSign      KeyUsage = 1 << 5 // 0x0020
+	KeyUsageCRLSign          KeyUsage = 1 << 6 // 0x0040
+	KeyUsageEncipherOnly     KeyUsage = 1 << 7 // 0x0080
+	KeyUsageDecipherOnly     KeyUsage = 1 << 8 // 0x0100
+)
+
 // OpenVPNOptions make all the relevant openvpn configuration options accessible to the
 // different modules that need it.
 type OpenVPNOptions struct {
@@ -111,6 +173,74 @@ type OpenVPNOptions struct {
 
 	// AuthUserPass indicates that auth-user-pass was present in the config.
 	AuthUserPass bool
+
+	// AuthNoCache indicates that auth-nocache was present in the config.
+	// When set, suggests that credentials should not be cached in memory.
+	// Note: In Go, true secure memory zeroing is not guaranteed due to GC.
+	AuthNoCache bool
+
+	// Fragment is the --fragment option value (max UDP packet size).
+	// Only supported for UDP. 0 means disabled.
+	Fragment int
+
+	// RenegotiateSeconds is the maximum time in seconds before renegotiating data channel keys.
+	// Default is 3600 (1 hour). Set to 0 to disable time-based renegotiation.
+	RenegotiateSeconds int
+
+	// RenegotiateBytes is the number of bytes after which to renegotiate data channel keys.
+	// Default is -1 (disabled). Set to 0 to explicitly disable.
+	// For ciphers with block sizes < 128 bits, this defaults to 64MB if not set.
+	RenegotiateBytes int64
+
+	// RenegotiatePackets is the number of packets after which to renegotiate data channel keys.
+	// Default is 0 (disabled). Corresponds to OpenVPN's --reneg-pkts option.
+	RenegotiatePackets int64
+
+	// TransitionWindow is how long in seconds a lame duck key stays alive after soft reset.
+	// Default is 60 seconds. Corresponds to OpenVPN's --transition-window option.
+	TransitionWindow int
+
+	// Ping is the interval in seconds for sending keepalive ping packets.
+	// Default is 0 (disabled, uses hardcoded 10s). When set, sends ping every N seconds.
+	// Corresponds to OpenVPN's --ping option.
+	Ping int
+
+	// PingRestart is the timeout in seconds after which the tunnel is restarted
+	// if no packets are received. Default is 0 (disabled).
+	// When triggered, sends SOFT_RESET to renegotiate keys.
+	// Corresponds to OpenVPN's --ping-restart option.
+	PingRestart int
+
+	// PingExit is the timeout in seconds after which the client exits
+	// if no packets are received. Default is 0 (disabled).
+	// PingExit takes precedence over PingRestart if both are set.
+	// Corresponds to OpenVPN's --ping-exit option.
+	PingExit int
+
+	// HandshakeWindow is the time in seconds within which the TLS handshake
+	// (including receiving PUSH_REPLY) must complete. Default is 60.
+	// Also controls the maximum number of PUSH_REQUEST retries.
+	// Corresponds to OpenVPN's --hand-window option.
+	HandshakeWindow int
+
+	// VerifyX509Name is the expected X.509 name to verify against the server certificate.
+	// Used together with VerifyX509Type. Empty means no verification.
+	// Corresponds to OpenVPN's --verify-x509-name option.
+	VerifyX509Name string
+
+	// VerifyX509Type specifies how to match the VerifyX509Name against the certificate.
+	// Default is VerifyX509None (no verification).
+	VerifyX509Type VerifyX509Type
+
+	// RemoteCertKU specifies the required Key Usage bits for the server certificate.
+	// Multiple values are allowed; the certificate must match at least one.
+	// Corresponds to OpenVPN's --remote-cert-ku option.
+	RemoteCertKU []KeyUsage
+
+	// RemoteCertEKU specifies the required Extended Key Usage OID or name for the server certificate.
+	// Example values: "serverAuth", "TLS Web Server Authentication", "1.3.6.1.5.5.7.3.1"
+	// Corresponds to OpenVPN's --remote-cert-eku option.
+	RemoteCertEKU string
 }
 
 // ReadConfigFile expects a string with a path to a valid config file,
@@ -371,6 +501,7 @@ func parseTLSVerMax(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
 		o.TLSMaxVer = "1.3"
 		return o, nil
 	}
+	log.Printf("warn: tls-version-max %s is ignored (uTLS manages TLS version)", p[0])
 	if p[0] == "1.2" {
 		o.TLSMaxVer = "1.2"
 	}
@@ -386,16 +517,260 @@ func parseProxyOBFS4(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
 	return o, nil
 }
 
+func parseFragment(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "fragment expects one arg")
+	}
+	size, err := strconv.Atoi(p[0])
+	if err != nil {
+		return o, fmt.Errorf("%w: fragment: invalid size: %s", ErrBadConfig, p[0])
+	}
+	if size < 68 || size > 65535 {
+		return o, fmt.Errorf("%w: fragment: size must be between 68 and 65535", ErrBadConfig)
+	}
+	o.Fragment = size
+	return o, nil
+}
+
+// parseRenegSec parses the --reneg-sec option.
+// Syntax: reneg-sec max [min]
+// We only support the max value; min is ignored (used by servers for randomization).
+func parseRenegSec(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) == 0 || len(p) > 2 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "reneg-sec expects one or two args")
+	}
+	seconds, err := strconv.Atoi(p[0])
+	if err != nil || seconds < 0 {
+		return o, fmt.Errorf("%w: reneg-sec: invalid value: %s", ErrBadConfig, p[0])
+	}
+	o.RenegotiateSeconds = seconds
+	// Note: p[1] (min) is ignored for clients; servers use it for randomization
+	return o, nil
+}
+
+// parseRenegBytes parses the --reneg-bytes option.
+func parseRenegBytes(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "reneg-bytes expects one arg")
+	}
+	bytes, err := strconv.ParseInt(p[0], 10, 64)
+	if err != nil || bytes < 0 {
+		return o, fmt.Errorf("%w: reneg-bytes: invalid value: %s", ErrBadConfig, p[0])
+	}
+	o.RenegotiateBytes = bytes
+	return o, nil
+}
+
+// parseRenegPkts parses the --reneg-pkts option.
+func parseRenegPkts(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "reneg-pkts expects one arg")
+	}
+	pkts, err := strconv.ParseInt(p[0], 10, 64)
+	if err != nil || pkts < 0 {
+		return o, fmt.Errorf("%w: reneg-pkts: invalid value: %s", ErrBadConfig, p[0])
+	}
+	o.RenegotiatePackets = pkts
+	return o, nil
+}
+
+// parseTransitionWindow parses the --transition-window option.
+// This sets how long a lame duck key stays alive after soft reset.
+func parseTransitionWindow(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "transition-window expects one arg")
+	}
+	seconds, err := strconv.Atoi(p[0])
+	if err != nil || seconds < 0 {
+		return o, fmt.Errorf("%w: transition-window: invalid value: %s", ErrBadConfig, p[0])
+	}
+	o.TransitionWindow = seconds
+	return o, nil
+}
+
+// parsePing parses the --ping option.
+func parsePing(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "ping expects one arg")
+	}
+	seconds, err := strconv.Atoi(p[0])
+	if err != nil || seconds < 0 {
+		return o, fmt.Errorf("%w: ping: invalid value: %s", ErrBadConfig, p[0])
+	}
+	o.Ping = seconds
+	return o, nil
+}
+
+// parsePingRestart parses the --ping-restart option.
+func parsePingRestart(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "ping-restart expects one arg")
+	}
+	seconds, err := strconv.Atoi(p[0])
+	if err != nil || seconds < 0 {
+		return o, fmt.Errorf("%w: ping-restart: invalid value: %s", ErrBadConfig, p[0])
+	}
+	o.PingRestart = seconds
+	return o, nil
+}
+
+// parsePingExit parses the --ping-exit option.
+func parsePingExit(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "ping-exit expects one arg")
+	}
+	seconds, err := strconv.Atoi(p[0])
+	if err != nil || seconds < 0 {
+		return o, fmt.Errorf("%w: ping-exit: invalid value: %s", ErrBadConfig, p[0])
+	}
+	o.PingExit = seconds
+	return o, nil
+}
+
+// parseKeepalive parses the --keepalive option (macro for ping + ping-restart).
+func parseKeepalive(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 2 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "keepalive expects two args (interval timeout)")
+	}
+	interval, err := strconv.Atoi(p[0])
+	if err != nil || interval < 0 {
+		return o, fmt.Errorf("%w: keepalive: invalid interval: %s", ErrBadConfig, p[0])
+	}
+	timeout, err := strconv.Atoi(p[1])
+	if err != nil || timeout < 0 {
+		return o, fmt.Errorf("%w: keepalive: invalid timeout: %s", ErrBadConfig, p[1])
+	}
+	o.Ping = interval
+	o.PingRestart = timeout
+	return o, nil
+}
+
+// parseHandWindow parses the --hand-window option.
+func parseHandWindow(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "hand-window expects one arg")
+	}
+	seconds, err := strconv.Atoi(p[0])
+	if err != nil || seconds < 0 {
+		return o, fmt.Errorf("%w: hand-window: invalid value: %s", ErrBadConfig, p[0])
+	}
+	o.HandshakeWindow = seconds
+	return o, nil
+}
+
+// parseVerifyX509Name parses the --verify-x509-name option.
+// Syntax: verify-x509-name name [type]
+// type can be: subject (default), name, name-prefix
+func parseVerifyX509Name(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) == 0 || len(p) > 2 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "verify-x509-name expects 1 or 2 args")
+	}
+	if p[0] == "" {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "verify-x509-name: name cannot be empty")
+	}
+
+	o.VerifyX509Name = p[0]
+	o.VerifyX509Type = VerifyX509SubjectDN // default
+
+	if len(p) == 2 {
+		switch strings.ToLower(p[1]) {
+		case "subject":
+			o.VerifyX509Type = VerifyX509SubjectDN
+		case "name":
+			o.VerifyX509Type = VerifyX509SubjectRDN
+		case "name-prefix":
+			o.VerifyX509Type = VerifyX509SubjectRDNPrefix
+		default:
+			return o, fmt.Errorf("%w: verify-x509-name: unknown type: %s", ErrBadConfig, p[1])
+		}
+	}
+	return o, nil
+}
+
+// parseRemoteCertKU parses the --remote-cert-ku option.
+// Syntax: remote-cert-ku ku1 [ku2 ...]
+// Each ku is a hexadecimal Key Usage value (e.g., 80, a0, 88).
+// The certificate must match at least one of the specified values.
+func parseRemoteCertKU(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) == 0 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "remote-cert-ku expects at least one arg")
+	}
+
+	for _, kuStr := range p {
+		// Parse hexadecimal value (OpenVPN uses hex format)
+		kuVal, err := strconv.ParseUint(kuStr, 16, 16)
+		if err != nil {
+			return o, fmt.Errorf("%w: remote-cert-ku: invalid hex value: %s", ErrBadConfig, kuStr)
+		}
+		o.RemoteCertKU = append(o.RemoteCertKU, KeyUsage(kuVal))
+	}
+	return o, nil
+}
+
+// parseRemoteCertEKU parses the --remote-cert-eku option.
+// Syntax: remote-cert-eku oid
+// oid can be a dotted OID (e.g., 1.3.6.1.5.5.7.3.1) or a name (e.g., "serverAuth").
+func parseRemoteCertEKU(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "remote-cert-eku expects one arg")
+	}
+	if p[0] == "" {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "remote-cert-eku: oid cannot be empty")
+	}
+	o.RemoteCertEKU = p[0]
+	return o, nil
+}
+
+// parseRemoteCertTLS parses the --remote-cert-tls option.
+// Syntax: remote-cert-tls server|client
+// This is a convenience option that sets --remote-cert-eku to the appropriate TLS EKU.
+func parseRemoteCertTLS(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "remote-cert-tls expects one arg (server or client)")
+	}
+	switch strings.ToLower(p[0]) {
+	case "server":
+		// TLS Web Server Authentication (OID 1.3.6.1.5.5.7.3.1)
+		o.RemoteCertEKU = "serverAuth"
+	case "client":
+		// TLS Web Client Authentication (OID 1.3.6.1.5.5.7.3.2)
+		o.RemoteCertEKU = "clientAuth"
+	default:
+		return o, fmt.Errorf("%w: remote-cert-tls: must be 'server' or 'client', got: %s", ErrBadConfig, p[0])
+	}
+	return o, nil
+}
+
+func parseAuthNoCache(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	o.AuthNoCache = true
+	return o, nil
+}
+
 var pMap = map[string]interface{}{
-	"proto":           parseProto,
-	"remote":          parseRemote,
-	"cipher":          parseCipher,
-	"auth":            parseAuth,
-	"key-direction":   parseKeyDirection,
-	"compress":        parseCompress,
-	"comp-lzo":        parseCompLZO,
-	"proxy-obfs4":     parseProxyOBFS4,
-	"tls-version-max": parseTLSVerMax, // this is currently ignored because of uTLS
+	"proto":             parseProto,
+	"remote":            parseRemote,
+	"cipher":            parseCipher,
+	"auth":              parseAuth,
+	"key-direction":     parseKeyDirection,
+	"compress":          parseCompress,
+	"comp-lzo":          parseCompLZO,
+	"proxy-obfs4":       parseProxyOBFS4,
+	"tls-version-max":   parseTLSVerMax, // this is currently ignored because of uTLS
+	"fragment":          parseFragment,
+	"reneg-sec":         parseRenegSec,
+	"reneg-bytes":       parseRenegBytes,
+	"reneg-pkts":        parseRenegPkts,
+	"transition-window": parseTransitionWindow,
+	"ping":              parsePing,
+	"ping-restart":      parsePingRestart,
+	"ping-exit":         parsePingExit,
+	"keepalive":         parseKeepalive,
+	"hand-window":       parseHandWindow,
+	"verify-x509-name":  parseVerifyX509Name,
+	"auth-nocache":      parseAuthNoCache,
+	"remote-cert-ku":    parseRemoteCertKU,
+	"remote-cert-eku":   parseRemoteCertEKU,
+	"remote-cert-tls":   parseRemoteCertTLS,
 }
 
 var pMapDir = map[string]interface{}{
@@ -410,7 +785,7 @@ var pMapDir = map[string]interface{}{
 
 func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (*OpenVPNOptions, error) {
 	switch key {
-	case "proto", "remote", "cipher", "auth", "key-direction", "compress", "comp-lzo", "tls-version-max", "proxy-obfs4":
+	case "proto", "remote", "cipher", "auth", "key-direction", "compress", "comp-lzo", "tls-version-max", "proxy-obfs4", "fragment", "reneg-sec", "reneg-bytes", "reneg-pkts", "transition-window", "ping", "ping-restart", "ping-exit", "keepalive", "hand-window", "verify-x509-name", "auth-nocache", "remote-cert-ku", "remote-cert-eku", "remote-cert-tls":
 		fn := pMap[key].(func([]string, *OpenVPNOptions) (*OpenVPNOptions, error))
 		if updatedOpt, e := fn(p, opt); e != nil {
 			return updatedOpt, e
@@ -431,22 +806,27 @@ func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (
 // format. The config file supports inline file inclusion for <ca>, <cert> and <key>.
 func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 	opt := &OpenVPNOptions{
-		Remote:     "",
-		Port:       "",
-		Proto:      ProtoTCP,
-		Username:   "",
-		Password:   "",
-		CA:         []byte{},
-		Cert:       []byte{},
-		Key:        []byte{},
-		TLSAuth:    []byte{},
-		TLSCrypt:   []byte{},
-		TLSCryptV2: []byte{},
-		Cipher:     "",
-		Auth:       "",
-		TLSMaxVer:  "",
-		Compress:   CompressionEmpty,
-		ProxyOBFS4: "",
+		Remote:             "",
+		Port:               "",
+		Proto:              ProtoUDP,
+		Username:           "",
+		Password:           "",
+		CA:                 []byte{},
+		Cert:               []byte{},
+		Key:                []byte{},
+		TLSAuth:            []byte{},
+		TLSCrypt:           []byte{},
+		TLSCryptV2:         []byte{},
+		Cipher:             "",
+		Auth:               "",
+		TLSMaxVer:          "",
+		Compress:           CompressionEmpty,
+		ProxyOBFS4:         "",
+		RenegotiateSeconds: DefaultRenegotiateSeconds,
+		RenegotiateBytes:   DefaultRenegotiateBytes,
+		RenegotiatePackets: 0, // disabled by default
+		TransitionWindow:   DefaultTransitionWindow,
+		HandshakeWindow:    DefaultHandshakeWindow,
 	}
 
 	// tag and inlineBuf are used to parse inline files.
@@ -514,6 +894,13 @@ func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 			return nil, err
 		}
 	}
+
+	// Validate option combinations (matching OpenVPN behavior)
+	// --fragment can only be used with --proto udp
+	if opt.Proto.IsTCP() && opt.Fragment > 0 {
+		return nil, fmt.Errorf("%w: --fragment can only be used with --proto udp", ErrBadConfig)
+	}
+
 	return opt, nil
 }
 

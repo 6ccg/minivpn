@@ -337,6 +337,7 @@ func Test_newDataCipherFromCipherSuite(t *testing.T) {
 		{"aes-256-cbc", args{"AES-256-CBC"}, &dataCipherAES{32, "cbc"}, nil},
 		{"aes-128-gcm", args{"AES-128-GCM"}, &dataCipherAES{16, "gcm"}, nil},
 		{"aes-256-gcm", args{"AES-256-GCM"}, &dataCipherAES{32, "gcm"}, nil},
+		{"chacha20-poly1305", args{"CHACHA20-POLY1305"}, &dataCipherChaCha20Poly1305{}, nil},
 		{"bad-256-gcm", args{"AES-512-GCM"}, nil, ErrUnsupportedCipher},
 	}
 	for _, tt := range tests {
@@ -405,5 +406,110 @@ func TestPrf(t *testing.T) {
 	out := prf(secret, label, cseed, sseed, []byte{}, []byte{}, 16)
 	if !bytes.Equal(out, expected) {
 		t.Errorf("Bad output in prf call: %v", out)
+	}
+}
+
+func Test_dataCipherChaCha20Poly1305_encrypt_decrypt(t *testing.T) {
+	key := bytes.Repeat([]byte("A"), 64) // 64 bytes, we only use first 32
+	iv12, _ := hex.DecodeString("000000006868686868686868")
+	plaintext := []byte("this test is green")
+
+	c := &dataCipherChaCha20Poly1305{}
+
+	// Test encrypt
+	encrypted, err := c.encrypt(key, &plaintextData{
+		iv:        iv12,
+		plaintext: plaintext,
+		aead:      []byte{0x00, 0x01, 0x02, 0x03},
+	})
+	if err != nil {
+		t.Fatalf("encrypt failed: %v", err)
+	}
+
+	// Test decrypt
+	decrypted, err := c.decrypt(key, &encryptedData{
+		iv:         iv12,
+		ciphertext: encrypted,
+		aead:       []byte{0x00, 0x01, 0x02, 0x03},
+	})
+	if err != nil {
+		t.Fatalf("decrypt failed: %v", err)
+	}
+
+	if !bytes.Equal(decrypted, plaintext) {
+		t.Errorf("roundtrip failed: got %v, want %v", decrypted, plaintext)
+	}
+}
+
+func Test_dataCipherChaCha20Poly1305_decrypt_errors(t *testing.T) {
+	key := bytes.Repeat([]byte("A"), 64)
+	iv12, _ := hex.DecodeString("000000006868686868686868")
+
+	c := &dataCipherChaCha20Poly1305{}
+
+	// Test iv too short
+	_, err := c.decrypt(key, &encryptedData{
+		iv:         []byte{0x00},
+		ciphertext: []byte("ciphertext"),
+		aead:       []byte{0x00, 0x01, 0x02, 0x03},
+	})
+	if !errors.Is(err, ErrCannotDecrypt) {
+		t.Errorf("expected ErrCannotDecrypt for short iv, got %v", err)
+	}
+
+	// Test key too short
+	_, err = c.decrypt([]byte("short"), &encryptedData{
+		iv:         iv12,
+		ciphertext: []byte("ciphertext"),
+		aead:       []byte{0x00, 0x01, 0x02, 0x03},
+	})
+	if !errors.Is(err, ErrInvalidKeySize) {
+		t.Errorf("expected ErrInvalidKeySize for short key, got %v", err)
+	}
+}
+
+func Test_dataCipherChaCha20Poly1305_encrypt_errors(t *testing.T) {
+	key := bytes.Repeat([]byte("A"), 64)
+
+	c := &dataCipherChaCha20Poly1305{}
+
+	// Test iv too short
+	_, err := c.encrypt(key, &plaintextData{
+		iv:        []byte{0x00},
+		plaintext: []byte("plaintext"),
+		aead:      []byte{0x00, 0x01, 0x02, 0x03},
+	})
+	if !errors.Is(err, ErrCannotEncrypt) {
+		t.Errorf("expected ErrCannotEncrypt for short iv, got %v", err)
+	}
+
+	// Test key too short
+	_, err = c.encrypt([]byte("short"), &plaintextData{
+		iv:        []byte("123456789012"),
+		plaintext: []byte("plaintext"),
+		aead:      []byte{0x00, 0x01, 0x02, 0x03},
+	})
+	if !errors.Is(err, ErrInvalidKeySize) {
+		t.Errorf("expected ErrInvalidKeySize for short key, got %v", err)
+	}
+}
+
+func Test_dataCipherChaCha20Poly1305_properties(t *testing.T) {
+	c := &dataCipherChaCha20Poly1305{}
+
+	if c.keySizeBytes() != 32 {
+		t.Errorf("keySizeBytes() = %v, want 32", c.keySizeBytes())
+	}
+
+	if !c.isAEAD() {
+		t.Errorf("isAEAD() = false, want true")
+	}
+
+	if c.blockSize() != 16 {
+		t.Errorf("blockSize() = %v, want 16", c.blockSize())
+	}
+
+	if c.cipherMode() != cipherModeGCM {
+		t.Errorf("cipherMode() = %v, want %v", c.cipherMode(), cipherModeGCM)
 	}
 }

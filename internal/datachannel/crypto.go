@@ -17,6 +17,8 @@ import (
 	"log"
 
 	"github.com/ooni/minivpn/internal/bytesx"
+	"github.com/ooni/minivpn/internal/model"
+	"golang.org/x/crypto/chacha20poly1305"
 ) //#nosec G501,G505
 //  We know that sha1 and md5 are insecure, but we do not control the openvpn protocol.
 
@@ -40,6 +42,9 @@ const (
 
 	// cipherNameAES is an AES-based cipher.
 	cipherNameAES = cipherName("aes")
+
+	// cipherNameChaCha20Poly1305 is ChaCha20-Poly1305 AEAD cipher.
+	cipherNameChaCha20Poly1305 = cipherName("chacha20-poly1305")
 )
 
 // encrypteData holds the different parts needed to decrypt an encrypted data
@@ -48,6 +53,7 @@ type encryptedData struct {
 	iv         []byte
 	ciphertext []byte
 	aead       []byte
+	packetID   model.PacketID // For AEAD mode: replay check after decryption
 }
 
 // plaintextData holds the different parts needed to encrypt a plaintext
@@ -123,12 +129,11 @@ func (a *dataCipherAES) blockSize() uint8 {
 // Since key comes from a prf derivation, we only take as many bytes as we need to match
 // our key size.
 func (a *dataCipherAES) decrypt(key []byte, data *encryptedData) ([]byte, error) {
-	// TODO(ainghazal): split this function, it's too large
 	if len(key) < a.keySizeBytes() {
 		return nil, ErrInvalidKeySize
 	}
 
-	// they key material might be longer
+	// the key material might be longer
 	k := key[:a.keySizeBytes()]
 	block, err := aes.NewCipher(k)
 	if err != nil {
@@ -140,10 +145,14 @@ func (a *dataCipherAES) decrypt(key []byte, data *encryptedData) ([]byte, error)
 			return nil, fmt.Errorf("%w: wrong size for iv: %v", ErrCannotDecrypt, len(data.iv))
 		}
 		mode := cipher.NewCBCDecrypter(block, data.iv)
-		plaintext := make([]byte, len(data.ciphertext))
+		// Use pooled buffer for decryption
+		plaintext := defaultSlicePool.getSlice(len(data.ciphertext))
 		mode.CryptBlocks(plaintext, data.ciphertext)
+		// Unpad - note: BytesUnpadPKCS7 returns a subslice, original capacity preserved
 		plaintext, err := bytesx.BytesUnpadPKCS7(plaintext, block.BlockSize())
 		if err != nil {
+			// Return buffer to pool on error
+			defaultSlicePool.putSlice(plaintext)
 			return nil, err
 		}
 		return plaintext, nil
@@ -159,8 +168,16 @@ func (a *dataCipherAES) decrypt(key []byte, data *encryptedData) ([]byte, error)
 			return nil, err
 		}
 
-		plaintext, err := aesGCM.Open(nil, data.iv, data.ciphertext, data.aead)
+		// Pre-allocate plaintext buffer using pool
+		// GCM overhead is 16 bytes (tag size)
+		plaintextLen := len(data.ciphertext) - aesGCM.Overhead()
+		if plaintextLen < 0 {
+			return nil, fmt.Errorf("%w: ciphertext too short", ErrCannotDecrypt)
+		}
+		dst := defaultSlicePool.getSlice(plaintextLen)
+		plaintext, err := aesGCM.Open(dst[:0], data.iv, data.ciphertext, data.aead)
 		if err != nil {
+			defaultSlicePool.putSlice(dst)
 			log.Println("gcm decryption failed:", err.Error())
 			return nil, err
 		}
@@ -198,7 +215,8 @@ func (a *dataCipherAES) encrypt(key []byte, data *plaintextData) ([]byte, error)
 		}
 		mode := cipher.NewCBCEncrypter(block, data.iv)
 
-		ciphertext := make([]byte, len(data.plaintext))
+		// Use pooled buffer for encryption
+		ciphertext := defaultSlicePool.getSlice(len(data.plaintext))
 		mode.CryptBlocks(ciphertext, data.plaintext)
 		return ciphertext, nil
 
@@ -216,12 +234,101 @@ func (a *dataCipherAES) encrypt(key []byte, data *plaintextData) ([]byte, error)
 		// HMAC. The packet counter may not roll over within a single
 		// TLS session. This results in a unique IV for each packet, as
 		// required by GCM.
-		ciphertext := aesGCM.Seal(nil, data.iv, data.plaintext, data.aead)
+
+		// Pre-allocate ciphertext buffer using pool
+		// GCM adds Overhead() bytes (16 bytes for tag)
+		ciphertextLen := len(data.plaintext) + aesGCM.Overhead()
+		dst := defaultSlicePool.getSlice(ciphertextLen)
+		ciphertext := aesGCM.Seal(dst[:0], data.iv, data.plaintext, data.aead)
 		return ciphertext, nil
 
 	default:
 		return nil, ErrUnsupportedMode
 	}
+}
+
+// dataCipherChaCha20Poly1305 implements dataCipher for ChaCha20-Poly1305.
+type dataCipherChaCha20Poly1305 struct{}
+
+var _ dataCipher = &dataCipherChaCha20Poly1305{} // Ensure we implement dataCipher
+
+// keySizeBytes implements dataCipher.keySizeBytes
+// ChaCha20-Poly1305 uses a 256-bit (32 bytes) key.
+func (c *dataCipherChaCha20Poly1305) keySizeBytes() int {
+	return chacha20poly1305.KeySize // 32
+}
+
+// isAEAD implements dataCipher.isAEAD
+func (c *dataCipherChaCha20Poly1305) isAEAD() bool {
+	return true
+}
+
+// blockSize implements dataCipher.blockSize
+// ChaCha20-Poly1305 is a stream cipher, but OpenVPN treats it similar to GCM.
+func (c *dataCipherChaCha20Poly1305) blockSize() uint8 {
+	return 16
+}
+
+// cipherMode implements dataCipher.cipherMode
+func (c *dataCipherChaCha20Poly1305) cipherMode() cipherMode {
+	return cipherModeGCM // Treated as AEAD similar to GCM
+}
+
+// decrypt implements dataCipher.decrypt
+func (c *dataCipherChaCha20Poly1305) decrypt(key []byte, data *encryptedData) ([]byte, error) {
+	if len(key) < c.keySizeBytes() {
+		return nil, ErrInvalidKeySize
+	}
+	k := key[:c.keySizeBytes()]
+
+	aead, err := chacha20poly1305.New(k)
+	if err != nil {
+		return nil, err
+	}
+
+	// Standard nonce size for ChaCha20-Poly1305 is 12 bytes
+	if len(data.iv) != chacha20poly1305.NonceSize {
+		return nil, fmt.Errorf("%w: wrong size for iv: %v", ErrCannotDecrypt, len(data.iv))
+	}
+
+	// Pre-allocate plaintext buffer using pool
+	plaintextLen := len(data.ciphertext) - aead.Overhead()
+	if plaintextLen < 0 {
+		return nil, fmt.Errorf("%w: ciphertext too short", ErrCannotDecrypt)
+	}
+	dst := defaultSlicePool.getSlice(plaintextLen)
+	plaintext, err := aead.Open(dst[:0], data.iv, data.ciphertext, data.aead)
+	if err != nil {
+		defaultSlicePool.putSlice(dst)
+		log.Println("chacha20-poly1305 decryption failed:", err.Error())
+		return nil, err
+	}
+	return plaintext, nil
+}
+
+// encrypt implements dataCipher.encrypt
+func (c *dataCipherChaCha20Poly1305) encrypt(key []byte, data *plaintextData) ([]byte, error) {
+	if len(key) < c.keySizeBytes() {
+		return nil, ErrInvalidKeySize
+	}
+	k := key[:c.keySizeBytes()]
+
+	aead, err := chacha20poly1305.New(k)
+	if err != nil {
+		return nil, err
+	}
+
+	// Standard nonce size for ChaCha20-Poly1305 is 12 bytes
+	if len(data.iv) != chacha20poly1305.NonceSize {
+		return nil, fmt.Errorf("%w: wrong size for iv: %v", ErrCannotEncrypt, len(data.iv))
+	}
+
+	// Pre-allocate ciphertext buffer using pool
+	// ChaCha20-Poly1305 adds Overhead() bytes (16 bytes for tag)
+	ciphertextLen := len(data.plaintext) + aead.Overhead()
+	dst := defaultSlicePool.getSlice(ciphertextLen)
+	ciphertext := aead.Seal(dst[:0], data.iv, data.plaintext, data.aead)
+	return ciphertext, nil
 }
 
 // newDataCipherFromCipherSuite constructs a new dataCipher from the cipher suite string.
@@ -235,8 +342,12 @@ func newDataCipherFromCipherSuite(c string) (dataCipher, error) {
 		return newDataCipher(cipherNameAES, 256, cipherModeCBC)
 	case "AES-128-GCM":
 		return newDataCipher(cipherNameAES, 128, cipherModeGCM)
+	case "AES-192-GCM":
+		return newDataCipher(cipherNameAES, 192, cipherModeGCM)
 	case "AES-256-GCM":
 		return newDataCipher(cipherNameAES, 256, cipherModeGCM)
+	case "CHACHA20-POLY1305":
+		return &dataCipherChaCha20Poly1305{}, nil
 	default:
 		return nil, ErrUnsupportedCipher
 	}

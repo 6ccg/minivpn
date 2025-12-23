@@ -14,6 +14,20 @@ import (
 	"github.com/ooni/minivpn/pkg/config"
 )
 
+// Channel buffer sizes for high-frequency data paths.
+// These buffers help absorb traffic bursts and prevent goroutine blocking.
+// Reference: OpenVPN uses similar buffering in its packet queues.
+const (
+	// dataChannelBuffer is the buffer size for data channel packets (MuxerToData, DataOrControlToMuxer).
+	dataChannelBuffer = 64
+
+	// networkIOBuffer is the buffer size for raw network I/O (MuxerToNetwork, NetworkToMuxer).
+	networkIOBuffer = 64
+
+	// tunBuffer is the buffer size for TUN device read/write (tunUp, tunDown).
+	tunBuffer = 64
+)
+
 // connectChannel connects an existing channel (a "signal" in Qt terminology)
 // to a nil pointer to channel (a "slot" in Qt terminology).
 func connectChannel[T any](signal chan T, slot **chan T) {
@@ -34,7 +48,7 @@ func startWorkers(config *config.Config, conn networkio.FramingConn,
 
 	// create the networkio service.
 	nio := &networkio.Service{
-		MuxerToNetwork: make(chan []byte),
+		MuxerToNetwork: make(chan []byte, networkIOBuffer),
 		NetworkToMuxer: nil,
 	}
 
@@ -44,9 +58,9 @@ func startWorkers(config *config.Config, conn networkio.FramingConn,
 		MuxerToData:          nil,
 		NotifyTLS:            nil,
 		HardReset:            make(chan any, 1),
-		DataOrControlToMuxer: make(chan *model.Packet),
+		DataOrControlToMuxer: make(chan *model.Packet, dataChannelBuffer),
 		MuxerToNetwork:       nil,
-		NetworkToMuxer:       make(chan []byte),
+		NetworkToMuxer:       make(chan []byte, networkIOBuffer),
 	}
 
 	// connect networkio and packetmuxer
@@ -55,7 +69,7 @@ func startWorkers(config *config.Config, conn networkio.FramingConn,
 
 	// create the datachannel service.
 	datach := &datachannel.Service{
-		MuxerToData:          make(chan *model.Packet),
+		MuxerToData:          make(chan *model.Packet, dataChannelBuffer),
 		DataOrControlToMuxer: nil,
 		KeyReady:             make(chan *session.DataChannelKey, 1),
 		TUNToData:            tunDevice.tunDown,
@@ -109,6 +123,10 @@ func startWorkers(config *config.Config, conn networkio.FramingConn,
 
 	// connect the muxer and the tlsstate service
 	connectChannel(tlsx.NotifyTLS, &muxer.NotifyTLS)
+
+	// connect datachannel to tlssession and reliable transport for renegotiation support
+	connectChannel(tlsx.NotifyTLS, &datach.NotifyTLS)
+	connectChannel(rel.ControlToReliable, &datach.ControlToReliable)
 
 	// start all the workers
 	nio.StartWorkers(config, workersManager, conn)

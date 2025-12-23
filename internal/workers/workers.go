@@ -68,3 +68,15 @@ func (m *Manager) ShouldShutdown() <-chan any {
 func (m *Manager) WaitWorkersShutdown() {
 	m.wg.Wait()
 }
+
+// TrackGoroutine registers a background goroutine with the manager.
+// Call this before starting a goroutine that should be waited on during shutdown.
+func (m *Manager) TrackGoroutine() {
+	m.wg.Add(1)
+}
+
+// UntrackGoroutine marks a tracked goroutine as done.
+// This must be called (typically via defer) when the goroutine exits.
+func (m *Manager) UntrackGoroutine() {
+	m.wg.Done()
+}
