@@ -1,6 +1,9 @@
 package tlssession
 
 import (
+	"errors"
+	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -51,6 +54,43 @@ func Test_tlsBio(t *testing.T) {
 		got := <-down
 		if string(got) != "abcd" {
 			t.Errorf("did not write what expected")
+		}
+	})
+
+	t.Run("read deadline returns timeout", func(t *testing.T) {
+		up := make(chan []byte)
+		down := make(chan []byte, 1)
+		tls := newTLSBio(log.Log, up, down)
+
+		tls.SetReadDeadline(time.Now().Add(-time.Second))
+		buf := make([]byte, 1)
+		n, err := tls.Read(buf)
+		if n != 0 {
+			t.Fatalf("expected 0 bytes read")
+		}
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("expected deadline error, got %v", err)
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			t.Fatalf("expected net.Error timeout, got %T %v", err, err)
+		}
+	})
+
+	t.Run("write deadline returns timeout", func(t *testing.T) {
+		up := make(chan []byte, 1)
+		down := make(chan []byte)
+		tls := newTLSBio(log.Log, up, down)
+
+		tls.SetWriteDeadline(time.Now().Add(-time.Second))
+		n, err := tls.Write([]byte("abcd"))
+		if n != 0 {
+			t.Fatalf("expected 0 bytes written")
+		}
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("expected deadline error, got %v", err)
+		}
+		if ne, ok := err.(net.Error); !ok || !ne.Timeout() {
+			t.Fatalf("expected net.Error timeout, got %T %v", err, err)
 		}
 	})
 

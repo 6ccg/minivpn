@@ -114,9 +114,6 @@ func readLines(f string) ([]string, error) {
 
 // This main function exercises AES256GCM
 func main() {
-	tmp, err := os.MkdirTemp("", "minivpn-integration-test")
-	defer os.RemoveAll(tmp) // clean up
-
 	fmt.Println("launching docker")
 	configData, pool, resource, err := launchDocker("AES-256-GCM", "SHA256")
 	if err != nil {
@@ -125,19 +122,8 @@ func main() {
 	// when all test done, time to kill and remove the container
 	defer stopContainer(pool, resource)
 
-	cfgFile, err := os.CreateTemp(tmp, "minivpn-e2e-")
-	if err != nil {
-		log.WithError(err).Fatal("Cannot create temporary file")
-	}
-	defer cfgFile.Close()
-	fmt.Println("Config written to: " + cfgFile.Name())
-
-	if _, err = cfgFile.Write(configData); err != nil {
-		log.WithError(err).Fatal("Failed to write config to temporary file")
-	}
-
 	// actual test begins
-	vpnConfig := config.NewConfig(config.WithConfigFile(cfgFile.Name()))
+	vpnConfig := config.NewConfig(config.WithConfigBytes(configData))
 
 	dialer := networkio.NewDialer(log.Log, &net.Dialer{})
 	conn, err := dialer.DialContext(context.TODO(), vpnConfig.Remote().Protocol, vpnConfig.Remote().Endpoint)

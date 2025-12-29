@@ -13,13 +13,12 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"strings"
 )
 
 // Debug helper: check if a debug env var is enabled
-func debugEnabled(envVar string) bool {
-	return os.Getenv(envVar) == "1" || os.Getenv("MINIVPN_DEBUG_ALL") == "1"
+func debugEnabled(_ string) bool {
+	return false
 }
 
 // The auth keys provided by the server are 64 bytes, but tls-auth

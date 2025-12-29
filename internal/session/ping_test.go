@@ -10,6 +10,7 @@ import (
 func TestPingConfig(t *testing.T) {
 	tests := []struct {
 		name         string
+		proto        config.Proto
 		ping         int
 		pingRestart  int
 		pingExit     int
@@ -17,16 +18,18 @@ func TestPingConfig(t *testing.T) {
 		wantTimeout  int
 		wantAction   int
 	}{
-		{"all disabled", 0, 0, 0, 0, 0, PingTimeoutActionNone},
-		{"ping only", 10, 0, 0, 10, 0, PingTimeoutActionNone},
-		{"ping-restart only", 0, 60, 0, 0, 60, PingTimeoutActionRestart},
-		{"ping-exit only", 0, 0, 120, 0, 120, PingTimeoutActionExit},
-		{"ping-exit takes precedence", 10, 60, 120, 10, 120, PingTimeoutActionExit},
-		{"keepalive equivalent", 10, 60, 0, 10, 60, PingTimeoutActionRestart},
+		{"udp pre-pull ping-restart default", config.ProtoUDP, 0, 0, 0, 0, config.PrePullInitialPingRestart, PingTimeoutActionRestart},
+		{"tcp all disabled", config.ProtoTCP, 0, 0, 0, 0, 0, PingTimeoutActionNone},
+		{"ping only", config.ProtoUDP, 10, 0, 0, 10, config.PrePullInitialPingRestart, PingTimeoutActionRestart},
+		{"ping-restart only", config.ProtoUDP, 0, 60, 0, 0, 60, PingTimeoutActionRestart},
+		{"ping-exit only", config.ProtoUDP, 0, 0, 120, 0, 120, PingTimeoutActionExit},
+		{"ping-exit takes precedence", config.ProtoUDP, 10, 60, 120, 10, 120, PingTimeoutActionExit},
+		{"keepalive equivalent", config.ProtoUDP, 10, 60, 0, 10, 60, PingTimeoutActionRestart},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := &config.OpenVPNOptions{
+				Proto:       tt.proto,
 				Ping:        tt.ping,
 				PingRestart: tt.pingRestart,
 				PingExit:    tt.pingExit,

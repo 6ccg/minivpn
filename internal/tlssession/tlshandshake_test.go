@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"errors"
 	"math/big"
 	"net"
@@ -449,6 +450,28 @@ func Test_parrotTLSFactory(t *testing.T) {
 		}
 	})
 
+	t.Run("tls-version-max 1.2 removes TLS1.3 from supported versions", func(t *testing.T) {
+		conn := &mocks.Conn{}
+		conf := &tls.Config{InsecureSkipVerify: true, MaxVersion: tls.VersionTLS12}
+
+		got, err := parrotTLSFactory(conn, conf)
+		if err != nil {
+			t.Fatalf("parrotTLSFactory() error = %v, wantErr %v", err, nil)
+		}
+		uc, ok := got.(*tls.UConn)
+		if !ok {
+			t.Fatalf("parrotTLSFactory() = %T, want *tls.UConn", got)
+		}
+		if err := uc.BuildHandshakeState(); err != nil {
+			t.Fatalf("BuildHandshakeState() error = %v, want nil", err)
+		}
+		for _, v := range uc.HandshakeState.Hello.SupportedVersions {
+			if v == tls.VersionTLS13 {
+				t.Fatalf("SupportedVersions contains TLS1.3, want it removed")
+			}
+		}
+	})
+
 	t.Run("an hex clienthello that cannot be decoded to raw bytes should raise ErrBadParrot", func(t *testing.T) {
 		defer func(original string) {
 			vpnClientHelloHex = original
@@ -741,54 +764,66 @@ func Test_customVerify(t *testing.T) {
 
 func Test_formatSubjectDN(t *testing.T) {
 	tests := []struct {
-		name    string
-		subject pkix.Name
-		want    string
+		name string
+		rdns pkix.RDNSequence
+		want string
 	}{
 		{
 			name: "full subject DN",
-			subject: pkix.Name{
-				Country:            []string{"KG"},
-				Province:           []string{"NA"},
-				Locality:           []string{"Bishkek"},
-				Organization:       []string{"MyOrg"},
-				OrganizationalUnit: []string{"MyOU"},
-				CommonName:         "Server-1",
+			rdns: pkix.RDNSequence{
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 6}, Value: "KG"}},       // C
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 8}, Value: "NA"}},       // ST
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 7}, Value: "Bishkek"}},  // L
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 10}, Value: "MyOrg"}},   // O
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 11}, Value: "MyOU"}},    // OU
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: "Server-1"}}, // CN
 			},
 			want: "C=KG, ST=NA, L=Bishkek, O=MyOrg, OU=MyOU, CN=Server-1",
 		},
 		{
 			name: "only common name",
-			subject: pkix.Name{
-				CommonName: "vpn.example.com",
+			rdns: pkix.RDNSequence{
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: "vpn.example.com"}}, // CN
 			},
 			want: "CN=vpn.example.com",
 		},
 		{
 			name: "country and common name only",
-			subject: pkix.Name{
-				Country:    []string{"US"},
-				CommonName: "test-server",
+			rdns: pkix.RDNSequence{
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 6}, Value: "US"}},          // C
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: "test-server"}}, // CN
 			},
 			want: "C=US, CN=test-server",
 		},
 		{
-			name:    "empty subject",
-			subject: pkix.Name{},
-			want:    "",
+			name: "empty subject",
+			rdns: pkix.RDNSequence{},
+			want: "",
 		},
 		{
 			name: "multiple countries",
-			subject: pkix.Name{
-				Country:    []string{"US", "CA"},
-				CommonName: "multi-country",
+			rdns: pkix.RDNSequence{
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 6}, Value: "US"}},            // C
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 6}, Value: "CA"}},            // C
+				{{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: "multi-country"}}, // CN
 			},
 			want: "C=US, C=CA, CN=multi-country",
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := formatSubjectDN(tt.subject)
+			cert := &x509.Certificate{}
+			if len(tt.rdns) > 0 {
+				raw, err := asn1.Marshal(tt.rdns)
+				if err != nil {
+					t.Fatalf("asn1.Marshal(RDNSequence) failed: %v", err)
+				}
+				cert.RawSubject = raw
+			}
+			got, err := formatSubjectDN(cert)
+			if err != nil {
+				t.Fatalf("formatSubjectDN() failed: %v", err)
+			}
 			if got != tt.want {
 				t.Errorf("formatSubjectDN() = %q, want %q", got, tt.want)
 			}
@@ -807,6 +842,17 @@ func Test_verifyX509Name(t *testing.T) {
 			CommonName:   "vpn.example.com",
 		},
 	}
+	rawSubject, err := asn1.Marshal(pkix.RDNSequence{
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 6}, Value: "KG"}},              // C
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 8}, Value: "NA"}},              // ST
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 7}, Value: "Bishkek"}},         // L
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 10}, Value: "TestOrg"}},        // O
+		{{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: "vpn.example.com"}}, // CN
+	})
+	if err != nil {
+		t.Fatalf("asn1.Marshal(RDNSequence) failed: %v", err)
+	}
+	testCert.RawSubject = rawSubject
 
 	tests := []struct {
 		name         string

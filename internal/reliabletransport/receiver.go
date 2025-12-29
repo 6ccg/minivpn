@@ -25,12 +25,26 @@ func (ws *workersState) moveUpWorker() {
 	ws.logger.Debugf("%s: started", workerName)
 
 	receiver := newReliableReceiver(ws.logger, ws.incomingSeen)
+	lastRemoteSessionID := append([]byte(nil), ws.sessionManager.RemoteSessionID()...)
+	lastControlEpoch := ws.sessionManager.ControlEpoch()
 
 	for {
 		// POSSIBLY BLOCK reading a packet to move up the stack
 		// or POSSIBLY BLOCK waiting for notifications
 		select {
 		case packet := <-ws.muxerToReliable:
+			// Reset per-session reliable sequencing state when the remote session ID changes.
+			// This is required for server-initiated HARD_RESET_SERVER_V2 which starts a new session
+			// with packet IDs reset to 0/1.
+			if current := ws.sessionManager.RemoteSessionID(); !bytes.Equal(current, lastRemoteSessionID) {
+				lastRemoteSessionID = append([]byte(nil), current...)
+				receiver.Reset()
+			}
+			if current := ws.sessionManager.ControlEpoch(); current != lastControlEpoch {
+				lastControlEpoch = current
+				receiver.Reset()
+			}
+
 			ws.tracer.OnIncomingPacket(packet, ws.sessionManager.NegotiationState())
 
 			ws.logger.Debugf(
@@ -64,9 +78,18 @@ func (ws *workersState) moveUpWorker() {
 				return
 			}
 
-			// we only want to insert control packets going to the tls layer
-			if packet.Opcode != model.P_CONTROL_V1 {
+			// We need to pass both P_CONTROL_V1 and P_CONTROL_SOFT_RESET_V1 to the control channel.
+			// P_CONTROL_V1 carries TLS records, while P_CONTROL_SOFT_RESET_V1 signals server-initiated
+			// key renegotiation. Filtering out SOFT_RESET here would prevent the control channel from
+			// receiving renegotiation requests, causing the connection to hang when the server initiates
+			// a soft reset (the subsequent P_CONTROL_V1 packets would block on TLSRecordUp with no reader).
+			// Reference: OpenVPN ssl.c:3543-3557 processes P_CONTROL_SOFT_RESET_V1 inline.
+			if packet.Opcode != model.P_CONTROL_V1 && packet.Opcode != model.P_CONTROL_SOFT_RESET_V1 {
 				continue
+			}
+
+			if packet.Opcode == model.P_CONTROL_SOFT_RESET_V1 {
+				receiver.ResetWithStartingID(packet.ID)
 			}
 
 			if inserted := receiver.MaybeInsertIncoming(packet); !inserted {
@@ -158,11 +181,56 @@ func newReliableReceiver(logger model.Logger, ch chan incomingPacketSeen) *relia
 	}
 }
 
+// Reset clears the per-session receiver state (queue + sequencing counters).
+// This is used when the remote session ID changes (HARD reset/new session).
+func (r *reliableReceiver) Reset() {
+	r.resetWithLastConsumed(0)
+}
+
+// ResetWithStartingID clears the per-session receiver state (queue + sequencing
+// counters) and prepares for a new control sequence that starts at startID.
+//
+// This is used for SOFT_RESET-triggered renegotiation where packet IDs restart.
+func (r *reliableReceiver) ResetWithStartingID(startID model.PacketID) {
+	// lastConsumed tracks the last delivered ID; to accept startID next we need
+	// lastConsumed=startID-1 (wraparound allowed).
+	r.resetWithLastConsumed(startID - 1)
+}
+
+func (r *reliableReceiver) resetWithLastConsumed(lastConsumed model.PacketID) {
+	for _, p := range r.incomingPackets {
+		if p != nil {
+			p.Free()
+		}
+	}
+	r.incomingPackets = make(incomingSequence, 0)
+	r.lastConsumed = lastConsumed
+}
+
+func packetIDLess(a, b model.PacketID) bool {
+	// Implements the same wraparound comparison as OpenVPN's reliable_pid_min():
+	// a < b (mod 2^32), allowing wraparound.
+	return int32(a-b) < 0
+}
+
 func (r *reliableReceiver) MaybeInsertIncoming(p *model.Packet) bool {
 	// Check 1: drop replay packets (already consumed)
 	// This matches OpenVPN's reliable_not_replay() check: id < packet_id
-	if p.ID <= r.lastConsumed {
-		r.logger.Debugf("dropping replay packet: id=%d <= lastConsumed=%d", p.ID, r.lastConsumed)
+	nextExpected := r.lastConsumed + 1
+	if packetIDLess(p.ID, nextExpected) {
+		r.logger.Debugf("dropping replay packet: id=%d < nextExpected=%d", p.ID, nextExpected)
+		return false
+	}
+
+	// Check 1b: drop packets that would break sequentiality (bounded receive window).
+	// This matches OpenVPN's reliable_wont_break_sequentiality().
+	if uint32(p.ID-nextExpected) >= uint32(RELIABLE_RECV_BUFFER_SIZE) {
+		r.logger.Debugf(
+			"dropping packet that breaks sequentiality window: id=%d nextExpected=%d window=%d",
+			p.ID,
+			nextExpected,
+			RELIABLE_RECV_BUFFER_SIZE,
+		)
 		return false
 	}
 
@@ -211,7 +279,7 @@ func (r *reliableReceiver) NextIncomingSequence() incomingSequence {
 }
 
 func (r *reliableReceiver) newIncomingPacketSeen(p *model.Packet) incomingPacketSeen {
-	incomingPacket := incomingPacketSeen{}
+	incomingPacket := incomingPacketSeen{keyID: p.KeyID}
 	if p.Opcode == model.P_ACK_V1 {
 		incomingPacket.acks = optional.Some(p.ACKs)
 	} else {

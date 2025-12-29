@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/ooni/minivpn/internal/bytesx"
@@ -23,7 +25,33 @@ var (
 	// ErrNoPushReply is returned when the server does not send PUSH_REPLY within
 	// the expected time window.
 	ErrNoPushReply = errors.New("no reply from server to push requests")
+
+	// pushRequestInterval is the interval between PUSH_REQUEST retries.
+	// The default matches OpenVPN's PUSH_REQUEST_INTERVAL constant in common.h.
+	//
+	// This is a variable so tests can reduce it to keep them fast.
+	pushRequestInterval = time.Duration(vpnconfig.PushRequestInterval) * time.Second
+
+	// ErrTLSNegotiationTimeout is returned when the TLS key negotiation does not
+	// complete within the configured hand-window.
+	// This matches the reference OpenVPN behavior (ssl.c:2747).
+	ErrTLSNegotiationTimeout = session.ErrTLSNegotiationTimeout
 )
+
+func applyTLSMaxVersionOption(tlsConf *tls.Config, opt *vpnconfig.OpenVPNOptions) error {
+	if tlsConf == nil || opt == nil {
+		return nil
+	}
+	switch opt.TLSMaxVer {
+	case "", "1.3":
+		tlsConf.MaxVersion = tls.VersionTLS13
+	case "1.2":
+		tlsConf.MaxVersion = tls.VersionTLS12
+	default:
+		return fmt.Errorf("%w: unknown tls-version-max parameter: %s", vpnconfig.ErrBadConfig, opt.TLSMaxVer)
+	}
+	return nil
+}
 
 // Service is the tlssession service. Make sure you initialize
 // the channels before invoking [Service.StartWorkers].
@@ -141,6 +169,9 @@ func (ws *workersState) tlsAuth() error {
 	if err != nil {
 		return err
 	}
+	if err := applyTLSMaxVersionOption(tlsConf, ws.options); err != nil {
+		return err
+	}
 
 	// run the real algorithm in a background goroutine
 	// Use buffered channel to prevent goroutine leak if tlsAuth returns
@@ -167,10 +198,41 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 	ws.logger.Debug("tlsession: doTLSAuth: started")
 	defer ws.logger.Debug("tlssession: doTLSAuth: done")
 
+	handshakeWindow := ws.options.HandshakeWindow
+	if handshakeWindow <= 0 {
+		handshakeWindow = vpnconfig.DefaultHandshakeWindow
+	}
+	defaultTimeout := time.Duration(handshakeWindow) * time.Second
+	negotiationTimeout := ws.sessionManager.NegotiationTimeRemaining()
+	if negotiationTimeout <= 0 {
+		negotiationTimeout = defaultTimeout
+	}
+	if negotiationTimeout <= 0 {
+		errorch <- fmt.Errorf("%w: invalid hand-window=%d", ErrTLSNegotiationTimeout, handshakeWindow)
+		return
+	}
+
+	var timedOut atomic.Bool
+	stage := "tls-handshake"
+
+	timeoutTimer := time.AfterFunc(negotiationTimeout, func() {
+		timedOut.Store(true)
+		_ = conn.Close()
+	})
+	defer timeoutTimer.Stop()
+
+	reportErr := func(err error) {
+		if timedOut.Load() {
+			errorch <- fmt.Errorf("%w: stage=%s after %s: %v", ErrTLSNegotiationTimeout, stage, negotiationTimeout, err)
+			return
+		}
+		errorch <- err
+	}
+
 	// do the TLS handshake
 	tlsConn, err := tlsHandshakeFn(conn, config)
 	if err != nil {
-		errorch <- err
+		reportErr(err)
 		return
 	}
 	ws.logger.Debug("tlssession: TLS handshake completed")
@@ -179,30 +241,34 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 	// defer tlsConn.Close()
 
 	// we need the active key to create the first control message
+	stage = "active-key"
 	activeKey, err := ws.sessionManager.ActiveKey()
 	if err != nil {
-		errorch <- err
+		reportErr(err)
 		return
 	}
 
 	// send the first control message with random material
+	stage = "auth-request"
 	if err := ws.sendAuthRequestMessage(tlsConn, activeKey); err != nil {
-		errorch <- err
+		reportErr(err)
 		return
 	}
 	ws.sessionManager.SetNegotiationState(model.S_SENT_KEY)
 
 	// read the server's keySource and options
+	stage = "auth-reply"
 	remoteKey, serverOptions, err := ws.recvAuthReplyMessage(tlsConn)
 	if err != nil {
-		errorch <- err
+		reportErr(err)
 		return
 	}
 	ws.logger.Debugf("Remote options: %s", serverOptions)
 
 	// init the tunnel info
+	stage = "tunnel-info"
 	if err := ws.sessionManager.InitTunnelInfo(serverOptions); err != nil {
-		errorch <- err
+		reportErr(err)
 		return
 	}
 
@@ -210,18 +276,36 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 	activeKey.AddRemoteKey(remoteKey)
 	ws.sessionManager.SetNegotiationState(model.S_GOT_KEY)
 
+	// Control channel established; stop treating hand-window as a TLS negotiation timeout.
+	// OpenVPN clears must_negotiate when reaching S_ACTIVE (ssl.c:2793) and uses a
+	// separate PUSH_REQUEST retry loop bounded by hand-window.
+	ws.sessionManager.SetNegotiationState(model.S_ACTIVE)
+	timeoutTimer.Stop()
+
 	// Send PUSH_REQUEST and keep retrying until we receive PUSH_REPLY.
 	// The reference OpenVPN client periodically resends PUSH_REQUEST, because
 	// some servers defer the push-reply until the connection is fully ready.
-	// Uses hand-window (default 60s) for total timeout and 5s retry interval
-	// matching OpenVPN's PUSH_REQUEST_INTERVAL constant.
-	pushRequestInterval := time.Duration(vpnconfig.PushRequestInterval) * time.Second
-	handshakeWindow := ws.options.HandshakeWindow
-	if handshakeWindow <= 0 {
-		handshakeWindow = vpnconfig.DefaultHandshakeWindow
+	// OpenVPN bounds the number of PUSH_REQUEST retries based on --hand-window:
+	//   max_push_requests = handshake_window / PUSH_REQUEST_INTERVAL
+	// (push.c:369).
+	//
+	// We use a duration division to support faster intervals in tests.
+	interval := pushRequestInterval
+	if interval <= 0 {
+		interval = time.Duration(vpnconfig.PushRequestInterval) * time.Second
 	}
-	pushReplyTimeout := time.Duration(handshakeWindow) * time.Second
+	maxPushRequests := int(time.Duration(handshakeWindow) * time.Second / interval)
+	if maxPushRequests <= 0 {
+		_ = tlsConn.Close()
+		errorch <- fmt.Errorf(
+			"%w: no reply from server after sending %d push requests",
+			ErrNoPushReply,
+			maxPushRequests,
+		)
+		return
+	}
 
+	stage = "push-request"
 	if err := ws.sendPushRequestMessage(tlsConn); err != nil {
 		errorch <- err
 		return
@@ -232,25 +316,27 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 	ws.workersManager.TrackGoroutine()
 	go func() {
 		defer ws.workersManager.UntrackGoroutine()
-		ticker := time.NewTicker(pushRequestInterval)
+		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		deadline := time.NewTimer(pushReplyTimeout)
-		defer deadline.Stop()
-
-		attempt := 1
+		attempt := 1 // first PUSH_REQUEST already sent
 		for {
 			select {
 			case <-ticker.C:
 				attempt++
+				if attempt > maxPushRequests {
+					pushTimeout <- fmt.Errorf(
+						"%w: no reply from server after sending %d push requests",
+						ErrNoPushReply,
+						maxPushRequests,
+					)
+					_ = tlsConn.Close()
+					return
+				}
 				ws.logger.Debugf("tlssession: resend push request attempt=%d", attempt)
 				if err := ws.sendPushRequestMessage(tlsConn); err != nil {
 					ws.logger.Warnf("tlssession: resend push request: %v", err)
 				}
-			case <-deadline.C:
-				pushTimeout <- fmt.Errorf("%w after %s (%d requests)", ErrNoPushReply, pushReplyTimeout, attempt)
-				_ = tlsConn.Close()
-				return
 			case <-stopPushRequests:
 				return
 			case <-ws.workersManager.ShouldShutdown():
@@ -260,6 +346,7 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 		}
 	}()
 
+	stage = "push-reply"
 	tinfo, err := ws.recvPushResponseMessage(tlsConn)
 	close(stopPushRequests)
 	if err != nil {
@@ -274,9 +361,6 @@ func (ws *workersState) doTLSAuth(conn net.Conn, config *tls.Config, errorch cha
 
 	// update with extra information obtained from push response
 	ws.sessionManager.UpdateTunnelInfo(tinfo)
-
-	// progress to the ACTIVE state
-	ws.sessionManager.SetNegotiationState(model.S_ACTIVE)
 
 	// notify the datachannel that we've got a key pair ready to use
 	ws.keyUp <- activeKey
@@ -333,6 +417,17 @@ func (ws *workersState) sendPushRequestMessage(conn net.Conn) error {
 	return err
 }
 
+// maxControlMessageSize is the maximum allowed size for a single control message.
+// This matches OpenVPN's TLS_CHANNEL_BUF_SIZE (defined in ssl.h) which is typically
+// around 2048 bytes for control channel messages. We use a slightly larger value
+// to accommodate PUSH_REPLY messages which can be longer.
+// This limit prevents memory exhaustion attacks where a malicious server sends
+// endless data without a NUL terminator.
+const maxControlMessageSize = 1 << 16 // 64KB - generous limit for PUSH_REPLY
+
+// ErrControlMessageTooLarge is returned when a control message exceeds the size limit.
+var ErrControlMessageTooLarge = errors.New("control message too large")
+
 type controlMessageReader struct {
 	pending []byte
 }
@@ -343,6 +438,11 @@ func (r *controlMessageReader) readNext(conn net.Conn, scratch []byte) ([]byte, 
 			msg := r.pending[:idx+1]
 			r.pending = r.pending[idx+1:]
 			return msg, nil
+		}
+		// Check size limit BEFORE reading more data to prevent memory exhaustion.
+		// This matches OpenVPN's behavior of rejecting oversized control messages.
+		if len(r.pending) >= maxControlMessageSize {
+			return nil, ErrControlMessageTooLarge
 		}
 		n, err := conn.Read(scratch)
 		if err != nil {
@@ -380,6 +480,7 @@ func (ws *workersState) recvPushResponseMessage(conn net.Conn) (*model.TunnelInf
 			optsMap := pushedOptionsAsMap(msg)
 			ws.logger.Infof("Server pushed options: %v", optsMap)
 			ws.applyPushedCipher(optsMap)
+			ws.applyPushedPingOptions(optsMap)
 			return newTunnelInfoFromPushedOptions(optsMap), nil
 		case bytes.HasPrefix(msg, []byte("AUTH_PENDING")):
 			ws.logger.Debugf("tlssession: received AUTH_PENDING, waiting for PUSH_REPLY")
@@ -410,6 +511,72 @@ func (ws *workersState) applyPushedCipher(opts remoteOptions) {
 	}
 	ws.logger.Infof("Negotiated data cipher: %s (from PUSH_REPLY, was %s)", canonical, ws.options.Cipher)
 	ws.options.Cipher = canonical
+}
+
+func (ws *workersState) applyPushedPingOptions(opts remoteOptions) {
+	if ws.options == nil || ws.sessionManager == nil {
+		return
+	}
+
+	pingSeconds := ws.options.Ping
+	pingRestartSeconds := ws.options.PingRestart
+	pingExitSeconds := ws.options.PingExit
+
+	// OpenVPN servers commonly push either:
+	// - keepalive <ping> <ping-restart>
+	// - ping <n>, ping-restart <n>
+	//
+	// We apply keepalive first, then apply explicit ping/ping-restart/ping-exit
+	// values to provide deterministic precedence.
+	if v, ok := opts["keepalive"]; ok && len(v) >= 2 {
+		interval, err1 := strconv.Atoi(strings.TrimSpace(v[0]))
+		timeout, err2 := strconv.Atoi(strings.TrimSpace(v[1]))
+		if err1 == nil && err2 == nil && interval >= 0 && timeout >= 0 {
+			pingSeconds = interval
+			pingRestartSeconds = timeout
+		} else {
+			ws.logger.Warnf("Ignoring invalid PUSH_REPLY keepalive: %v", v)
+		}
+	}
+
+	if v, ok := opts["ping"]; ok && len(v) >= 1 {
+		seconds, err := strconv.Atoi(strings.TrimSpace(v[0]))
+		if err == nil && seconds >= 0 {
+			pingSeconds = seconds
+		} else {
+			ws.logger.Warnf("Ignoring invalid PUSH_REPLY ping: %v", v)
+		}
+	}
+
+	if v, ok := opts["ping-restart"]; ok && len(v) >= 1 {
+		seconds, err := strconv.Atoi(strings.TrimSpace(v[0]))
+		if err == nil && seconds >= 0 {
+			pingRestartSeconds = seconds
+		} else {
+			ws.logger.Warnf("Ignoring invalid PUSH_REPLY ping-restart: %v", v)
+		}
+	}
+
+	if v, ok := opts["ping-exit"]; ok && len(v) >= 1 {
+		seconds, err := strconv.Atoi(strings.TrimSpace(v[0]))
+		if err == nil && seconds >= 0 {
+			pingExitSeconds = seconds
+		} else {
+			ws.logger.Warnf("Ignoring invalid PUSH_REPLY ping-exit: %v", v)
+		}
+	}
+
+	if pingSeconds == ws.options.Ping &&
+		pingRestartSeconds == ws.options.PingRestart &&
+		pingExitSeconds == ws.options.PingExit {
+		return
+	}
+
+	ws.options.Ping = pingSeconds
+	ws.options.PingRestart = pingRestartSeconds
+	ws.options.PingExit = pingExitSeconds
+	ws.sessionManager.SetPingOptions(pingSeconds, pingRestartSeconds, pingExitSeconds)
+	ws.logger.Infof("Updated ping config from PUSH_REPLY: ping=%ds ping-restart=%ds ping-exit=%ds", pingSeconds, pingRestartSeconds, pingExitSeconds)
 }
 
 func canonicalSupportedCipher(cipher string) (string, bool) {

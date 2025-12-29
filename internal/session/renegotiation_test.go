@@ -272,13 +272,14 @@ func TestShouldRenegotiate(t *testing.T) {
 		mgr.MarkKeyEstablished()
 
 		// Should not trigger before threshold
-		mgr.AddDataChannelBytes(500, 400)
+		// Use AddKeyBytes for per-key counters (matches OpenVPN ssl.c:3256/3890)
+		mgr.AddKeyBytes(KS_PRIMARY, 500, 400)
 		if mgr.ShouldRenegotiate() {
 			t.Error("should not trigger renegotiation before bytes threshold")
 		}
 
 		// Add more bytes to exceed threshold
-		mgr.AddDataChannelBytes(50, 60)
+		mgr.AddKeyBytes(KS_PRIMARY, 50, 60)
 		if !mgr.ShouldRenegotiate() {
 			t.Error("should trigger renegotiation after bytes threshold")
 		}

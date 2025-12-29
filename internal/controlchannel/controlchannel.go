@@ -98,7 +98,7 @@ func (ws *workersState) moveUpWorker() {
 			// route the packets depending on their opcode
 			switch packet.Opcode {
 
-			case model.P_CONTROL_SOFT_RESET_V1:
+					case model.P_CONTROL_SOFT_RESET_V1:
 				// We cannot blindly accept SOFT_RESET requests. They only make sense
 				// when we have received the remote's key material (S_GOT_KEY or later).
 				// This matches OpenVPN's DECRYPT_KEY_ENABLED check for client mode.
@@ -111,20 +111,25 @@ func (ws *workersState) moveUpWorker() {
 					continue
 				}
 
-				// Perform key soft reset: move current key to lame duck slot,
-				// prepare for new key negotiation. This preserves the old key
-				// for transition_window seconds to allow in-flight packets.
-				if err := ws.sessionManager.KeySoftReset(); err != nil {
-					ws.logger.Warnf("%s: soft reset failed: %v", workerName, err)
-					packet.Free() // release buffer back to pool
-					continue
-				}
+						remoteKeyID := packet.KeyID
 
-				// Advance the key ID for the new key negotiation.
-				// This follows OpenVPN's key_id cycling: 0→1→2→...→7→1→...
-				newKeyID := ws.sessionManager.NextKeyID()
-				ws.logger.Debugf("%s: server-initiated SOFT_RESET, new key_id=%d", workerName, newKeyID)
-				ws.sessionManager.SetNegotiationState(model.S_INITIAL)
+						// Perform key soft reset: move current key to lame duck slot,
+						// prepare for new key negotiation. This preserves the old key
+						// for transition_window seconds to allow in-flight packets.
+						if err := ws.sessionManager.KeySoftReset(); err != nil {
+							ws.logger.Warnf("%s: soft reset failed: %v", workerName, err)
+							packet.Free() // release buffer back to pool
+							continue
+						}
+
+						// KeySoftReset already advances key_id internally (matching OpenVPN's
+						// key_state_init() behavior), so we must NOT call NextKeyID() again.
+						newKeyID := ws.sessionManager.CurrentKeyID()
+						if newKeyID != uint8(remoteKeyID) {
+							ws.logger.Warnf("%s: server-initiated SOFT_RESET key_id mismatch (remote=%d local=%d)", workerName, remoteKeyID, newKeyID)
+						}
+						ws.logger.Debugf("%s: server-initiated SOFT_RESET, new key_id=%d", workerName, newKeyID)
+						ws.sessionManager.SetNegotiationState(model.S_INITIAL)
 
 				// Release buffer now - no longer needed
 				packet.Free()

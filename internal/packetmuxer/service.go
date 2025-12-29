@@ -2,10 +2,10 @@
 package packetmuxer
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	"github.com/ooni/minivpn/internal/bytespool"
@@ -19,7 +19,7 @@ import (
 
 // debugWireEnabled checks if wire-level debug is enabled
 func debugWireEnabled() bool {
-	return os.Getenv("MINIVPN_DEBUG_WIRE") == "1" || os.Getenv("MINIVPN_DEBUG_ALL") == "1"
+	return false
 }
 
 var serviceName = "packetmuxer"
@@ -68,6 +68,7 @@ func (s *Service) StartWorkers(
 		hardReset: s.HardReset,
 		// initialize to a sufficiently long time from now
 		hardResetTicker:      time.NewTicker(longWakeup),
+		handshakeTimer:       time.NewTimer(longWakeup),
 		notifyTLS:            *s.NotifyTLS,
 		dataOrControlToMuxer: s.DataOrControlToMuxer,
 		muxerToReliable:      *s.MuxerToReliable,
@@ -98,6 +99,10 @@ type workersState struct {
 
 	// hardResetTicker is a channel to retry the initial send of hard reset packet.
 	hardResetTicker *time.Ticker
+
+	// handshakeTimer fires when the must_negotiate deadline is reached.
+	// This mirrors OpenVPN's must_negotiate check in ssl.c:2747.
+	handshakeTimer *time.Timer
 
 	// notifyTLS is used to send notifications to the TLS service.
 	notifyTLS chan<- *model.Notification
@@ -154,6 +159,33 @@ func (ws *workersState) moveUpWorker() {
 				continue
 			}
 
+		case <-ws.handshakeTimer.C:
+			// Are we timed out on receive?
+			// Matches OpenVPN ssl.c:2747:
+			// if (now >= ks->must_negotiate && ks->state < S_ACTIVE) { ... goto error; }
+			if ws.sessionManager.CheckNegotiationTimeout() {
+				hw := ws.sessionManager.HandshakeWindow()
+				if hw <= 0 {
+					hw = time.Duration(config.DefaultHandshakeWindow) * time.Second
+				}
+				seconds := int(hw.Seconds())
+				ws.logger.Warnf(
+					"TLS Error: TLS key negotiation failed to occur within %d seconds (check your network connectivity)",
+					seconds,
+				)
+				err := fmt.Errorf(
+					"%w: TLS key negotiation failed to occur within %d seconds (check your network connectivity)",
+					session.ErrTLSNegotiationTimeout,
+					seconds,
+				)
+				select {
+				case ws.sessionManager.Failure <- err:
+				default:
+				}
+				return
+			}
+			ws.armHandshakeTimer()
+
 		case <-ws.hardResetTicker.C:
 			// retry the hard reset, it probably was lost
 			if err := ws.startHardReset(); err != nil {
@@ -188,8 +220,21 @@ func (ws *workersState) moveDownWorker() {
 		// POSSIBLY BLOCK on reading the packet moving down the stack
 		select {
 		case packet := <-ws.dataOrControlToMuxer:
+			// OpenVPN 2.5 sets tls-auth/tls-crypt anti-replay fields at send time
+			// (see ssl.c:write_control_auth). Ensure they advance on every
+			// transmission, including retransmissions of the same cleartext packet.
+			sendPacket := packet
+			if (packet.IsControl() || packet.Opcode == model.P_ACK_V1) &&
+				ws.sessionManager.PacketAuth().Mode != wire.ControlSecurityModeNone {
+				cloned := *packet
+				sendPacket = &cloned
+				if err := ws.sessionManager.RefreshControlReplayProtection(sendPacket); err != nil {
+					ws.logger.Warnf("%s: cannot refresh control replay fields: %v", workerName, err)
+					continue
+				}
+			}
 			// serialize the packet
-			rawPacket, err := wire.MarshalPacket(packet, ws.sessionManager.PacketAuth())
+			rawPacket, err := wire.MarshalPacket(sendPacket, ws.sessionManager.PacketAuth())
 			if err != nil {
 				ws.logger.Warnf("%s: cannot serialize packet: %s", workerName, err.Error())
 				continue
@@ -215,7 +260,7 @@ func (ws *workersState) moveDownWorker() {
 
 			select {
 			case ws.muxerToNetwork <- rawPacket:
-				// nothing
+				ws.sessionManager.NotifyOutgoingPacket()
 			case <-ws.workersManager.ShouldShutdown():
 				return
 			}
@@ -231,6 +276,14 @@ func (ws *workersState) startHardReset() error {
 	// increment the hard reset counter for retries
 	ws.hardResetCount++
 
+	// The first attempt indicates a new hard reset session. Reset session state
+	// so we can accept a new remote session-id.
+	if ws.hardResetCount == 1 {
+		if err := ws.sessionManager.ResetForNewSession(); err != nil {
+			return err
+		}
+	}
+
 	// initialize timeout on first attempt (exponential backoff like OpenVPN)
 	if ws.hardResetTimeout == 0 {
 		ws.hardResetTimeout = 2 * time.Second
@@ -238,6 +291,7 @@ func (ws *workersState) startHardReset() error {
 
 	// reset the state to become initial again.
 	ws.sessionManager.SetNegotiationState(model.S_PRE_START)
+	ws.armHandshakeTimer()
 
 	// Reset the control channel replay filter for the new session.
 	ws.sessionManager.ResetControlReplay()
@@ -245,12 +299,10 @@ func (ws *workersState) startHardReset() error {
 	// emit a CONTROL_HARD_RESET_CLIENT_V2 pkt
 	packet := ws.sessionManager.NewHardResetPacket()
 	ws.logger.Debugf(
-		"packetmuxer: startHardReset count=%d timeout=%v opcode=%s replay=%d ts=%d",
+		"packetmuxer: startHardReset count=%d timeout=%v opcode=%s",
 		ws.hardResetCount,
 		ws.hardResetTimeout,
 		packet.Opcode,
-		packet.ReplayPacketID,
-		packet.Timestamp,
 	)
 	if err := ws.serializeAndEmit(packet); err != nil {
 		return err
@@ -264,6 +316,42 @@ func (ws *workersState) startHardReset() error {
 	}
 
 	return nil
+}
+
+func (ws *workersState) armHandshakeTimer() {
+	// Keep the timer aligned with must_negotiate, similar to OpenVPN's
+	// compute_earliest_wakeup() behavior.
+	remaining := ws.sessionManager.NegotiationTimeRemaining()
+	if remaining <= 0 {
+		// If must_negotiate isn't set, fall back to hand-window.
+		state := ws.sessionManager.NegotiationState()
+		if state < model.S_PRE_START || state >= model.S_ACTIVE {
+			ws.resetHandshakeTimer(longWakeup)
+			return
+		}
+		hw := ws.sessionManager.HandshakeWindow()
+		if hw <= 0 {
+			hw = time.Duration(config.DefaultHandshakeWindow) * time.Second
+		}
+		remaining = hw
+	}
+	ws.resetHandshakeTimer(remaining)
+}
+
+func (ws *workersState) resetHandshakeTimer(d time.Duration) {
+	if ws.handshakeTimer == nil {
+		return
+	}
+	if d <= 0 {
+		d = longWakeup
+	}
+	if !ws.handshakeTimer.Stop() {
+		select {
+		case <-ws.handshakeTimer.C:
+		default:
+		}
+	}
+	ws.handshakeTimer.Reset(d)
 }
 
 // handleRawPacket is the code invoked to handle a raw packet.
@@ -335,6 +423,74 @@ func (ws *workersState) handleRawPacket(rawPacket []byte) error {
 			peerID := int(packet.PeerID[0])<<16 | int(packet.PeerID[1])<<8 | int(packet.PeerID[2])
 			ws.sessionManager.MaybeSetPeerID(peerID)
 		}
+	}
+
+	// Session matching / hard-reset handling (OpenVPN tls_pre_decrypt style).
+	//
+	// If we already have a remote session-id and we receive a control packet with a
+	// different session-id, treat HARD_RESET_SERVER_V2 as a possible new session
+	// initial packet; otherwise drop the packet.
+	if packet.IsControl() || packet.Opcode == model.P_ACK_V1 {
+		if ws.sessionManager.IsRemoteSessionIDSet() {
+			remoteSID := ws.sessionManager.RemoteSessionID()
+			if remoteSID != nil && !bytes.Equal(packet.LocalSessionID[:], remoteSID) {
+				if packet.Opcode == model.P_CONTROL_HARD_RESET_SERVER_V2 {
+					ws.logger.Infof(
+						"packetmuxer: HARD_RESET_SERVER_V2 for new session (got=%x expected=%x); restarting session",
+						packet.LocalSessionID,
+						remoteSID,
+					)
+					if err := ws.sessionManager.ResetForNewSession(); err != nil {
+						ws.logger.Warnf("packetmuxer: failed to reset session for new hard reset: %v", err)
+						packet.Free()
+						return nil
+					}
+					ws.sessionManager.SetNegotiationState(model.S_PRE_START)
+					ws.armHandshakeTimer()
+				} else {
+					ws.logger.Warnf(
+						"packetmuxer: drop control packet with unknown session-id (opcode=%s got=%x expected=%x)",
+						packet.Opcode,
+						packet.LocalSessionID,
+						remoteSID,
+					)
+					packet.Free()
+					return nil
+				}
+			}
+		}
+	}
+
+	// If we receive a HARD_RESET_SERVER_V2 outside of S_PRE_START with a NEW
+	// session-id (i.e., remote session-id not yet set), treat it as a new session
+	// request and reset session-scoped state.
+	//
+	// OpenVPN 2.5 tls_pre_decrypt behavior: HARD_RESET packets from the SAME
+	// session (matching session-id) are legitimate retransmissions and should
+	// be processed normally, not trigger a session reset.
+	if packet.Opcode == model.P_CONTROL_HARD_RESET_SERVER_V2 {
+		state := ws.sessionManager.NegotiationState()
+		// Only reset if: (1) not in S_PRE_START, AND (2) remote session-id not yet set.
+		// If remote session-id IS set and we got here, it means the session-id matched
+		// (checked in L434-461), so this is a retransmission of the same session's
+		// HARD_RESET - we should NOT reset the session.
+		if state != model.S_PRE_START && !ws.sessionManager.IsRemoteSessionIDSet() {
+			ws.logger.Debugf("packetmuxer: received %s in state=%s with new session-id, starting new session", packet.Opcode, state)
+			if err := ws.sessionManager.HardReset(); err != nil {
+				ws.logger.Warnf("packetmuxer: hard reset failed: %v", err)
+				packet.Free() // release buffer back to pool
+				return nil
+			}
+			ws.sessionManager.SetNegotiationState(model.S_PRE_START)
+			ws.armHandshakeTimer()
+		}
+	}
+
+	// SOFT_RESET starts a new key_state and restarts control-channel packet-id
+	// sequencing on the peer. Reset control replay tracking before checking
+	// ReplayPacketID/Timestamp so we accept the first packets of the new epoch.
+	if packet.Opcode == model.P_CONTROL_SOFT_RESET_V1 && ws.sessionManager.NegotiationState() >= model.S_GOT_KEY {
+		ws.sessionManager.ResetControlReplay()
 	}
 
 	// Replay protection check for control channel packets.
@@ -452,6 +608,11 @@ func (ws *workersState) finishThreeWayHandshake(packet *model.Packet) error {
 
 // serializeAndEmit will write a serialized packet on the channel going down to the networkio layer.
 func (ws *workersState) serializeAndEmit(packet *model.Packet) error {
+	// Ensure control-channel anti-replay fields are populated for this send.
+	if err := ws.sessionManager.RefreshControlReplayProtection(packet); err != nil {
+		return err
+	}
+
 	// serialize it
 	rawPacket, err := wire.MarshalPacket(packet, ws.sessionManager.PacketAuth())
 	if err != nil {

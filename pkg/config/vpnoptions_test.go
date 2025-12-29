@@ -2,8 +2,7 @@ package config
 
 import (
 	"errors"
-	"os"
-	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -27,9 +26,9 @@ func TestOptions_String(t *testing.T) {
 		want   string
 	}{
 		{
-			name:   "empty cipher",
+			name:   "empty cipher and no compression",
 			fields: fields{},
-			want:   "",
+			want:   "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,auth SHA1,keysize 128,key-method 2,tls-client",
 		},
 		{
 			name: "proto tcp",
@@ -38,27 +37,29 @@ func TestOptions_String(t *testing.T) {
 				Auth:   "sha512",
 				Proto:  ProtoTCP,
 			},
-			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto TCPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client",
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto TCPv4_CLIENT,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client",
 		},
 		{
-			name: "compress stub",
+			// OpenVPN 2.5: all compression modes output ",comp-lzo" for backward compatibility
+			name: "compress stub outputs comp-lzo",
 			fields: fields{
 				Cipher:   "AES-128-GCM",
 				Auth:     "sha512",
 				Proto:    ProtoUDP,
 				Compress: CompressionStub,
 			},
-			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,compress stub",
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,comp-lzo",
 		},
 		{
-			name: "compress lzo-no",
+			// OpenVPN 2.5: all compression modes output ",comp-lzo" for backward compatibility
+			name: "compress lzo-no outputs comp-lzo",
 			fields: fields{
 				Cipher:   "AES-128-GCM",
 				Auth:     "sha512",
 				Proto:    ProtoUDP,
 				Compress: CompressionLZONo,
 			},
-			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,lzo-comp no",
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client,comp-lzo",
 		},
 		{
 			name: "proto udp6",
@@ -67,7 +68,18 @@ func TestOptions_String(t *testing.T) {
 				Auth:   "sha512",
 				Proto:  ProtoUDP6,
 			},
-			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv6,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client",
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client",
+		},
+		{
+			// CompressionUndef (empty string) should NOT output any compression string
+			name: "compression undef outputs nothing",
+			fields: fields{
+				Cipher:   "AES-128-GCM",
+				Auth:     "sha512",
+				Proto:    ProtoUDP,
+				Compress: CompressionUndef,
+			},
+			want: "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto UDPv4,cipher AES-128-GCM,auth sha512,keysize 128,key-method 2,tls-client",
 		},
 	}
 	for _, tt := range tests {
@@ -122,8 +134,8 @@ func TestGetOptionsFromLines(t *testing.T) {
 		if opt.Auth != "SHA512" {
 			t.Errorf("Auth not what expected")
 		}
-		if opt.Compress != CompressionEmpty {
-			t.Errorf("Expected compression empty")
+		if opt.Compress != CompressionUndef {
+			t.Errorf("Expected compression undef (no compression configured)")
 		}
 	})
 }
@@ -237,6 +249,80 @@ func TestGetOptionsFromLinesInlineAuthUserPass(t *testing.T) {
 	})
 }
 
+func TestGetOptionsFromLinesRejectsFilePathDirectives(t *testing.T) {
+	basedir := t.TempDir()
+	tests := []struct {
+		name  string
+		lines []string
+	}{
+		{
+			name:  "ca file path",
+			lines: []string{"ca ca.crt"},
+		},
+		{
+			name:  "cert file path",
+			lines: []string{"cert client.crt"},
+		},
+		{
+			name:  "key file path",
+			lines: []string{"key client.key"},
+		},
+		{
+			name:  "tls-auth file path",
+			lines: []string{"tls-auth ta.key"},
+		},
+		{
+			name:  "tls-auth file path with direction",
+			lines: []string{"tls-auth ta.key 1"},
+		},
+		{
+			name:  "tls-crypt file path",
+			lines: []string{"tls-crypt tc.key"},
+		},
+		{
+			name:  "tls-crypt-v2 file path",
+			lines: []string{"tls-crypt-v2 tc2.key"},
+		},
+		{
+			name:  "auth-user-pass file path",
+			lines: []string{"auth-user-pass auth.txt"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := getOptionsFromLines(tt.lines, basedir); err == nil {
+				t.Fatalf("Expected file path directive to be rejected: %q", tt.lines[0])
+			}
+		})
+	}
+}
+
+func TestAuthUserPassCredentialsCanBeInjectedByCaller(t *testing.T) {
+	l := []string{
+		"<ca>",
+		"ca_string",
+		"</ca>",
+		"auth-user-pass",
+	}
+	o, err := getOptionsFromLines(l, t.TempDir())
+	if err != nil {
+		t.Fatalf("Good options should not fail: %s", err)
+	}
+	if !o.AuthUserPass {
+		t.Fatalf("Expected AuthUserPass to be true")
+	}
+	if o.Username != "" || o.Password != "" {
+		t.Fatalf("Expected username/password to be empty before caller injection, got user=%q pass=%q", o.Username, o.Password)
+	}
+
+	o.Username = "user"
+	o.Password = "pass"
+	if !o.HasAuthInfo() {
+		t.Fatalf("Expected HasAuthInfo() to be true after caller injection")
+	}
+}
+
 func TestGetOptionsFromLinesNoFiles(t *testing.T) {
 	t.Run("getting certificatee should fail if no file passed", func(t *testing.T) {
 		l := []string{"ca ca.crt"}
@@ -247,14 +333,16 @@ func TestGetOptionsFromLinesNoFiles(t *testing.T) {
 }
 
 func TestGetOptionsNoCompression(t *testing.T) {
-	t.Run("compress is parsed as literal empty", func(t *testing.T) {
+	t.Run("compress (no args) is parsed as stub per OpenVPN 2.5", func(t *testing.T) {
+		// OpenVPN 2.5: "compress" with no argument = COMP_ALG_STUB + COMP_F_SWAP
+		// See options.c:7916-7920
 		l := []string{"compress"}
 		o, err := getOptionsFromLines(l, t.TempDir())
 		if err != nil {
 			t.Errorf("Should not fail: compress")
 		}
-		if o.Compress != "empty" {
-			t.Errorf("Expected compress==empty")
+		if o.Compress != CompressionStub {
+			t.Errorf("Expected compress==stub (OpenVPN 2.5 semantics), got %q", o.Compress)
 		}
 	})
 }
@@ -344,50 +432,25 @@ var dummyConfigFile = []byte(`proto udp
 cipher AES-128-GCM
 auth SHA1`)
 
-func writeDummyConfigFile(dir string) (string, error) {
-	f, err := os.CreateTemp(dir, "tmpfile-")
-	if err != nil {
-		return "", err
-	}
-	if _, err := f.Write(dummyConfigFile); err != nil {
-		_ = f.Close()
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		return "", err
-	}
-	return f.Name(), nil
-}
-
-func Test_ParseConfigFile(t *testing.T) {
-	t.Run("a valid configfile should be correctly parsed", func(t *testing.T) {
-		f, err := writeDummyConfigFile(t.TempDir())
+func Test_ReadConfigFromBytes(t *testing.T) {
+	t.Run("a valid config should be correctly parsed", func(t *testing.T) {
+		o, err := ReadConfigFromBytes(dummyConfigFile)
 		if err != nil {
-			t.Fatal("ParseConfigFile(): cannot write cert needed for the test")
-		}
-		o, err := ReadConfigFile(f)
-		if err != nil {
-			t.Errorf("ParseConfigFile(): expected err=%v, got=%v", nil, err)
+			t.Errorf("ReadConfigFromBytes(): expected err=%v, got=%v", nil, err)
 		}
 		wantProto := ProtoUDP
 		if o.Proto != wantProto {
-			t.Errorf("ParseConfigFile(): expected Proto=%v, got=%v", wantProto, o.Proto)
+			t.Errorf("ReadConfigFromBytes(): expected Proto=%v, got=%v", wantProto, o.Proto)
 		}
 		wantCipher := "AES-128-GCM"
 		if o.Cipher != wantCipher {
-			t.Errorf("ParseConfigFile(): expected=%v, got=%v", wantCipher, o.Cipher)
+			t.Errorf("ReadConfigFromBytes(): expected=%v, got=%v", wantCipher, o.Cipher)
 		}
 	})
 
-	t.Run("an empty file path should error", func(t *testing.T) {
-		if _, err := ReadConfigFile(""); err == nil {
-			t.Errorf("expected error with empty file")
-		}
-	})
-
-	t.Run("an http uri should fail", func(t *testing.T) {
-		if _, err := ReadConfigFile("http://example.com"); err == nil {
-			t.Errorf("expected error with http uri")
+	t.Run("ReadConfigFile is disabled and should return ErrBadConfig", func(t *testing.T) {
+		if _, err := ReadConfigFile("config.ovpn"); !errors.Is(err, ErrBadConfig) {
+			t.Errorf("ReadConfigFile(): want ErrBadConfig, got=%v", err)
 		}
 	})
 }
@@ -672,10 +735,10 @@ func Test_parseCompLZO(t *testing.T) {
 }
 
 func Test_parseOption(t *testing.T) {
-	t.Run("an unknown key should not return an error but fail gracefully", func(t *testing.T) {
+	t.Run("unknown key is fatal by default", func(t *testing.T) {
 		_, err := parseOption(&OpenVPNOptions{}, t.TempDir(), "unknownKey", []string{"a", "b"}, 0)
-		if err != nil {
-			t.Errorf("parseOption(): want %v, got %v", nil, err)
+		if !errors.Is(err, ErrBadConfig) {
+			t.Errorf("parseOption(): want %v, got %v", ErrBadConfig, err)
 		}
 	})
 }
@@ -753,182 +816,49 @@ func Test_parseAuthUser(t *testing.T) {
 	})
 }
 
-// TODO(ainghazal): either check returned value or check mutation of the options argument.
 func Test_parseTLSVerMax(t *testing.T) {
-	type args struct {
-		p []string
-		o *OpenVPNOptions
-	}
 	tests := []struct {
 		name    string
-		args    args
+		args    []string
 		wantErr error
+		wantVer string
 	}{
 		{
-			name:    "default",
-			args:    args{o: &OpenVPNOptions{}},
-			wantErr: nil,
-		},
-		{
-			name:    "default with good tls opt",
-			args:    args{p: []string{"1.2"}, o: &OpenVPNOptions{}},
-			wantErr: nil,
-		},
-		{
-			// TODO(ainghazal): this case should fail
-			name:    "default with too many parts",
-			args:    args{p: []string{"1.2", "1.3"}, o: &OpenVPNOptions{}},
-			wantErr: nil,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if _, err := parseTLSVerMax(tt.args.p, tt.args.o); !errors.Is(err, tt.wantErr) {
-				t.Errorf("parseTLSVerMax() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func Test_getCredentialsFromFile(t *testing.T) {
-	makeCreds := func(credStr string) string {
-		f, err := os.CreateTemp(t.TempDir(), "tmpfile-")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := f.Write([]byte(credStr)); err != nil {
-			_ = f.Close()
-			t.Fatal(err)
-		}
-		if err := f.Close(); err != nil {
-			t.Fatal(err)
-		}
-		return f.Name()
-	}
-
-	type args struct {
-		path string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    []string
-		wantErr error
-	}{
-		{
-			name:    "should fail with non-existing file",
-			args:    args{"/tmp/nonexistent"},
-			want:    nil,
+			name:    "no args should fail",
+			args:    []string{},
 			wantErr: ErrBadConfig,
 		},
 		{
-			name:    "should fail with empty file",
-			args:    args{makeCreds("")},
-			want:    nil,
+			name:    "1.2 sets TLSMaxVer",
+			args:    []string{"1.2"},
+			wantErr: nil,
+			wantVer: "1.2",
+		},
+		{
+			name:    "1.3 sets TLSMaxVer",
+			args:    []string{"1.3"},
+			wantErr: nil,
+			wantVer: "1.3",
+		},
+		{
+			name:    "too many args should fail",
+			args:    []string{"1.2", "1.3"},
 			wantErr: ErrBadConfig,
 		},
 		{
-			name:    "should fail with empty user",
-			args:    args{makeCreds("\n\n")},
-			want:    nil,
-			wantErr: ErrBadConfig,
-		},
-		{
-			name:    "should fail with empty pass",
-			args:    args{makeCreds("user\n\n")},
-			want:    nil,
+			name:    "unknown version should fail",
+			args:    []string{"1.4"},
 			wantErr: ErrBadConfig,
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := getCredentialsFromFile(tt.args.path)
-			if !errors.Is(err, tt.wantErr) {
-				t.Errorf("getCredentialsFromFile() error = %v, wantErr %v", err, tt.wantErr)
-				return
+			opt := &OpenVPNOptions{}
+			if _, err := parseTLSVerMax(tt.args, opt); !errors.Is(err, tt.wantErr) {
+				t.Fatalf("parseTLSVerMax() error = %v, wantErr %v", err, tt.wantErr)
 			}
-			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("getCredentialsFromFile() = %v, want %v", got, tt.want)
-			}
-		})
-	}
-}
-
-func Test_isSubdir(t *testing.T) {
-	type args struct {
-		parent string
-		sub    string
-	}
-	tests := []struct {
-		name    string
-		args    args
-		want    bool
-		wantErr bool
-	}{
-		{
-			name: "sunny path",
-			args: args{
-				parent: "/foo/bar",
-				sub:    "/foo/bar/baz",
-			},
-			want:    true,
-			wantErr: false,
-		},
-		{
-			name: "same dir",
-			args: args{
-				parent: "/foo/bar",
-				sub:    "/foo/bar",
-			},
-			want:    true,
-			wantErr: false,
-		},
-		{
-			name: "same dir w/ slash",
-			args: args{
-				parent: "/foo/bar",
-				sub:    "/foo/bar/",
-			},
-			want:    true,
-			wantErr: false,
-		},
-		{
-			name: "not subdir",
-			args: args{
-				parent: "/foo/bar",
-				sub:    "/foo",
-			},
-			want:    false,
-			wantErr: false,
-		},
-		{
-			name: "path traversal",
-			args: args{
-				parent: "/foo/bar",
-				sub:    "/foo/bar/./../",
-			},
-			want:    false,
-			wantErr: false,
-		},
-		{
-			name: "path traversal with .",
-			args: args{
-				parent: ".",
-				sub:    "/etc/",
-			},
-			want:    false,
-			wantErr: false,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := isSubdir(tt.args.parent, tt.args.sub)
-			if (err != nil) != tt.wantErr {
-				t.Errorf("isSubdir() error = %v, wantErr %v", err, tt.wantErr)
-				return
-			}
-			if got != tt.want {
-				t.Errorf("isSubdir() = %v, want %v", got, tt.want)
+			if tt.wantErr == nil && opt.TLSMaxVer != tt.wantVer {
+				t.Fatalf("TLSMaxVer = %q, want %q", opt.TLSMaxVer, tt.wantVer)
 			}
 		})
 	}
@@ -1275,6 +1205,68 @@ func TestPingDefaults(t *testing.T) {
 	})
 }
 
+func TestTransitionWindowDefaults(t *testing.T) {
+	t.Run("transition-window defaults to 3600 seconds", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.TransitionWindow != DefaultTransitionWindow {
+			t.Errorf("expected default TransitionWindow=%d, got %d", DefaultTransitionWindow, opt.TransitionWindow)
+		}
+	})
+
+	t.Run("transition-window is parsed from config", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"transition-window 120",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.TransitionWindow != 120 {
+			t.Errorf("expected TransitionWindow=120, got %d", opt.TransitionWindow)
+		}
+	})
+}
+
+func TestServerOptionsString_DefaultsWhenCipherNotSet(t *testing.T) {
+	l := []string{
+		"remote 0.0.0.0 1194",
+		"<ca>",
+		"ca_string",
+		"</ca>",
+	}
+	opt, err := getOptionsFromLines(l, t.TempDir())
+	if err != nil {
+		t.Fatalf("getOptionsFromLines: %v", err)
+	}
+	if opt.Auth != "SHA1" {
+		t.Fatalf("expected default Auth=SHA1, got %q", opt.Auth)
+	}
+	if opt.Cipher != "" {
+		t.Fatalf("expected default Cipher to be empty (negotiated via PUSH_REPLY), got %q", opt.Cipher)
+	}
+
+	s := opt.ServerOptionsString()
+	if s == "" {
+		t.Fatalf("expected non-empty ServerOptionsString when cipher is unset")
+	}
+	if strings.Contains(s, ",cipher ") {
+		t.Fatalf("expected ServerOptionsString to omit cipher when Cipher is unset: %q", s)
+	}
+	if !strings.Contains(s, ",auth SHA1,") {
+		t.Fatalf("expected ServerOptionsString to include default auth SHA1: %q", s)
+	}
+	if !strings.Contains(s, ",keysize 128,") {
+		t.Fatalf("expected ServerOptionsString to use legacy keysize 128 when cipher is unset: %q", s)
+	}
+}
+
 func TestHandshakeWindowDefaults(t *testing.T) {
 	t.Run("hand-window defaults to 60 seconds", func(t *testing.T) {
 		l := []string{
@@ -1499,8 +1491,9 @@ func TestRemoteCertKUParsing(t *testing.T) {
 		if len(opt.RemoteCertKU) != 1 {
 			t.Fatalf("expected 1 RemoteCertKU, got %d", len(opt.RemoteCertKU))
 		}
-		if opt.RemoteCertKU[0] != KeyUsage(0x80) {
-			t.Errorf("expected RemoteCertKU[0]=0x80, got 0x%x", opt.RemoteCertKU[0])
+		// OpenVPN 0x80 (digitalSignature) is converted to Go format 0x01
+		if opt.RemoteCertKU[0] != KeyUsageDigitalSignature {
+			t.Errorf("expected RemoteCertKU[0]=0x%x (digitalSignature), got 0x%x", KeyUsageDigitalSignature, opt.RemoteCertKU[0])
 		}
 	})
 
@@ -1516,7 +1509,15 @@ func TestRemoteCertKUParsing(t *testing.T) {
 		if len(opt.RemoteCertKU) != 3 {
 			t.Fatalf("expected 3 RemoteCertKU values, got %d", len(opt.RemoteCertKU))
 		}
-		expected := []KeyUsage{0x80, 0xa0, 0x88}
+		// OpenVPN format -> Go format:
+		// 0x80 -> 0x01 (digitalSignature)
+		// 0xa0 -> 0x05 (digitalSignature | keyEncipherment)
+		// 0x88 -> 0x11 (digitalSignature | keyAgreement)
+		expected := []KeyUsage{
+			KeyUsageDigitalSignature,                           // 0x80 -> 0x01
+			KeyUsageDigitalSignature | KeyUsageKeyEncipherment, // 0xa0 -> 0x05
+			KeyUsageDigitalSignature | KeyUsageKeyAgreement,    // 0x88 -> 0x11
+		}
 		for i, exp := range expected {
 			if opt.RemoteCertKU[i] != exp {
 				t.Errorf("expected RemoteCertKU[%d]=0x%x, got 0x%x", i, exp, opt.RemoteCertKU[i])
@@ -1536,9 +1537,12 @@ func TestRemoteCertKUParsing(t *testing.T) {
 		if len(opt.RemoteCertKU) != 2 {
 			t.Fatalf("expected 2 RemoteCertKU values, got %d", len(opt.RemoteCertKU))
 		}
-		if opt.RemoteCertKU[0] != KeyUsage(0xA0) {
-			t.Errorf("expected RemoteCertKU[0]=0xA0, got 0x%x", opt.RemoteCertKU[0])
+		// OpenVPN 0xA0 -> Go 0x05 (digitalSignature | keyEncipherment)
+		expectedA0 := KeyUsageDigitalSignature | KeyUsageKeyEncipherment
+		if opt.RemoteCertKU[0] != expectedA0 {
+			t.Errorf("expected RemoteCertKU[0]=0x%x, got 0x%x", expectedA0, opt.RemoteCertKU[0])
 		}
+		// OpenVPN 0xFF -> Go 0xFF (all 8 bits, symmetric after conversion)
 		if opt.RemoteCertKU[1] != KeyUsage(0xFF) {
 			t.Errorf("expected RemoteCertKU[1]=0xFF, got 0x%x", opt.RemoteCertKU[1])
 		}
@@ -1555,11 +1559,20 @@ func TestRemoteCertKUParsing(t *testing.T) {
 		}
 	})
 
-	t.Run("remote-cert-ku with no args returns error", func(t *testing.T) {
-		opt := &OpenVPNOptions{}
-		_, err := parseRemoteCertKU([]string{}, opt)
-		if err == nil {
-			t.Error("expected error for remote-cert-ku with no args")
+	t.Run("remote-cert-ku with no args requires KU extension", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-ku",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 1 {
+			t.Fatalf("expected 1 RemoteCertKU value, got %d", len(opt.RemoteCertKU))
+		}
+		if opt.RemoteCertKU[0] != KeyUsageRequired {
+			t.Errorf("expected RemoteCertKU[0]=0x%x (KeyUsageRequired), got 0x%x", KeyUsageRequired, opt.RemoteCertKU[0])
 		}
 	})
 
@@ -1637,7 +1650,7 @@ func TestRemoteCertEKUParsing(t *testing.T) {
 }
 
 func TestRemoteCertTLSParsing(t *testing.T) {
-	t.Run("remote-cert-tls server sets EKU to serverAuth", func(t *testing.T) {
+	t.Run("remote-cert-tls server sets EKU and requires KU", func(t *testing.T) {
 		l := []string{
 			"remote 0.0.0.0 1194",
 			"remote-cert-tls server",
@@ -1646,12 +1659,51 @@ func TestRemoteCertTLSParsing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getOptionsFromLines: %v", err)
 		}
-		if opt.RemoteCertEKU != "serverAuth" {
-			t.Errorf("expected RemoteCertEKU=serverAuth, got %q", opt.RemoteCertEKU)
+		if len(opt.RemoteCertKU) != 1 || opt.RemoteCertKU[0] != KeyUsageRequired {
+			t.Errorf("expected RemoteCertKU=[0x%x], got %v", KeyUsageRequired, opt.RemoteCertKU)
+		}
+		if opt.RemoteCertEKU != "TLS Web Server Authentication" {
+			t.Errorf("expected RemoteCertEKU=%q, got %q", "TLS Web Server Authentication", opt.RemoteCertEKU)
 		}
 	})
 
-	t.Run("remote-cert-tls client sets EKU to clientAuth", func(t *testing.T) {
+	t.Run("remote-cert-tls server then remote-cert-ku overrides KU but keeps EKU", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-tls server",
+			"remote-cert-ku 80",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 1 || opt.RemoteCertKU[0] != KeyUsageDigitalSignature {
+			t.Errorf("expected RemoteCertKU=[0x%x], got %v", KeyUsageDigitalSignature, opt.RemoteCertKU)
+		}
+		if opt.RemoteCertEKU != "TLS Web Server Authentication" {
+			t.Errorf("expected RemoteCertEKU=%q, got %q", "TLS Web Server Authentication", opt.RemoteCertEKU)
+		}
+	})
+
+	t.Run("remote-cert-ku then remote-cert-tls overrides KU to required", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"remote-cert-ku 80",
+			"remote-cert-tls server",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 1 || opt.RemoteCertKU[0] != KeyUsageRequired {
+			t.Errorf("expected RemoteCertKU=[0x%x], got %v", KeyUsageRequired, opt.RemoteCertKU)
+		}
+		if opt.RemoteCertEKU != "TLS Web Server Authentication" {
+			t.Errorf("expected RemoteCertEKU=%q, got %q", "TLS Web Server Authentication", opt.RemoteCertEKU)
+		}
+	})
+
+	t.Run("remote-cert-tls client sets EKU and requires KU", func(t *testing.T) {
 		l := []string{
 			"remote 0.0.0.0 1194",
 			"remote-cert-tls client",
@@ -1660,8 +1712,11 @@ func TestRemoteCertTLSParsing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getOptionsFromLines: %v", err)
 		}
-		if opt.RemoteCertEKU != "clientAuth" {
-			t.Errorf("expected RemoteCertEKU=clientAuth, got %q", opt.RemoteCertEKU)
+		if len(opt.RemoteCertKU) != 1 || opt.RemoteCertKU[0] != KeyUsageRequired {
+			t.Errorf("expected RemoteCertKU=[0x%x], got %v", KeyUsageRequired, opt.RemoteCertKU)
+		}
+		if opt.RemoteCertEKU != "TLS Web Client Authentication" {
+			t.Errorf("expected RemoteCertEKU=%q, got %q", "TLS Web Client Authentication", opt.RemoteCertEKU)
 		}
 	})
 
@@ -1674,8 +1729,11 @@ func TestRemoteCertTLSParsing(t *testing.T) {
 		if err != nil {
 			t.Fatalf("getOptionsFromLines: %v", err)
 		}
-		if opt.RemoteCertEKU != "serverAuth" {
-			t.Errorf("expected RemoteCertEKU=serverAuth, got %q", opt.RemoteCertEKU)
+		if len(opt.RemoteCertKU) != 1 || opt.RemoteCertKU[0] != KeyUsageRequired {
+			t.Errorf("expected RemoteCertKU=[0x%x], got %v", KeyUsageRequired, opt.RemoteCertKU)
+		}
+		if opt.RemoteCertEKU != "TLS Web Server Authentication" {
+			t.Errorf("expected RemoteCertEKU=%q, got %q", "TLS Web Server Authentication", opt.RemoteCertEKU)
 		}
 	})
 
@@ -1703,6 +1761,274 @@ func TestRemoteCertTLSParsing(t *testing.T) {
 		_, err := parseRemoteCertTLS([]string{"server", "extra"}, opt)
 		if err == nil {
 			t.Error("expected error for remote-cert-tls with too many args")
+		}
+	})
+}
+
+func TestOpenVPNKeyUsageToGo(t *testing.T) {
+	// Test conversion from OpenVPN "high-bit" format to Go "low-bit" format
+	// OpenVPN format: digitalSignature=0x80, nonRepudiation=0x40, keyEncipherment=0x20, etc.
+	// Go format: digitalSignature=0x01, nonRepudiation=0x02, keyEncipherment=0x04, etc.
+
+	tests := []struct {
+		name     string
+		ovpnKU   uint16
+		expected KeyUsage
+	}{
+		{
+			name:     "digitalSignature (OpenVPN 0x80 -> Go 0x01)",
+			ovpnKU:   0x80,
+			expected: KeyUsageDigitalSignature, // 0x01
+		},
+		{
+			name:     "nonRepudiation (OpenVPN 0x40 -> Go 0x02)",
+			ovpnKU:   0x40,
+			expected: KeyUsageNonRepudiation, // 0x02
+		},
+		{
+			name:     "keyEncipherment (OpenVPN 0x20 -> Go 0x04)",
+			ovpnKU:   0x20,
+			expected: KeyUsageKeyEncipherment, // 0x04
+		},
+		{
+			name:     "dataEncipherment (OpenVPN 0x10 -> Go 0x08)",
+			ovpnKU:   0x10,
+			expected: KeyUsageDataEncipherment, // 0x08
+		},
+		{
+			name:     "keyAgreement (OpenVPN 0x08 -> Go 0x10)",
+			ovpnKU:   0x08,
+			expected: KeyUsageKeyAgreement, // 0x10
+		},
+		{
+			name:     "keyCertSign (OpenVPN 0x04 -> Go 0x20)",
+			ovpnKU:   0x04,
+			expected: KeyUsageKeyCertSign, // 0x20
+		},
+		{
+			name:     "cRLSign (OpenVPN 0x02 -> Go 0x40)",
+			ovpnKU:   0x02,
+			expected: KeyUsageCRLSign, // 0x40
+		},
+		{
+			name:     "encipherOnly (OpenVPN 0x01 -> Go 0x80)",
+			ovpnKU:   0x01,
+			expected: KeyUsageEncipherOnly, // 0x80
+		},
+		{
+			name:     "combined: digitalSignature + keyEncipherment (OpenVPN 0xa0 -> Go 0x05)",
+			ovpnKU:   0xa0,                                               // 0x80 | 0x20
+			expected: KeyUsageDigitalSignature | KeyUsageKeyEncipherment, // 0x01 | 0x04 = 0x05
+		},
+		{
+			name:     "combined: digitalSignature + keyAgreement (OpenVPN 0x88 -> Go 0x11)",
+			ovpnKU:   0x88,                                            // 0x80 | 0x08
+			expected: KeyUsageDigitalSignature | KeyUsageKeyAgreement, // 0x01 | 0x10 = 0x11
+		},
+		{
+			name:     "zero value",
+			ovpnKU:   0x00,
+			expected: 0,
+		},
+		{
+			name:     "all first 8 bits set (OpenVPN 0xff -> Go 0xff)",
+			ovpnKU:   0xff,
+			expected: 0xff,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := OpenVPNKeyUsageToGo(tt.ovpnKU)
+			if got != tt.expected {
+				t.Errorf("OpenVPNKeyUsageToGo(0x%02x) = 0x%02x, want 0x%02x", tt.ovpnKU, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestParseRemoteCertKU_Conversion(t *testing.T) {
+	// Test that parseRemoteCertKU correctly converts OpenVPN format to Go format
+
+	t.Run("digitalSignature 0x80 converts to Go format", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseRemoteCertKU([]string{"80"}, opt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 1 {
+			t.Fatalf("expected 1 KU value, got %d", len(opt.RemoteCertKU))
+		}
+		// OpenVPN 0x80 (digitalSignature) should become Go 0x01
+		if opt.RemoteCertKU[0] != KeyUsageDigitalSignature {
+			t.Errorf("expected KeyUsageDigitalSignature (0x%02x), got 0x%02x",
+				KeyUsageDigitalSignature, opt.RemoteCertKU[0])
+		}
+	})
+
+	t.Run("combined 0xa0 converts correctly", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseRemoteCertKU([]string{"a0"}, opt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// OpenVPN 0xa0 = digitalSignature(0x80) | keyEncipherment(0x20)
+		// Go format = 0x01 | 0x04 = 0x05
+		expected := KeyUsageDigitalSignature | KeyUsageKeyEncipherment
+		if opt.RemoteCertKU[0] != expected {
+			t.Errorf("expected 0x%02x, got 0x%02x", expected, opt.RemoteCertKU[0])
+		}
+	})
+
+	t.Run("multiple values all convert correctly", func(t *testing.T) {
+		opt := &OpenVPNOptions{}
+		_, err := parseRemoteCertKU([]string{"80", "a0", "88"}, opt)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(opt.RemoteCertKU) != 3 {
+			t.Fatalf("expected 3 KU values, got %d", len(opt.RemoteCertKU))
+		}
+		// 0x80 -> digitalSignature (0x01)
+		if opt.RemoteCertKU[0] != KeyUsageDigitalSignature {
+			t.Errorf("KU[0]: expected 0x%02x, got 0x%02x", KeyUsageDigitalSignature, opt.RemoteCertKU[0])
+		}
+		// 0xa0 -> digitalSignature | keyEncipherment (0x05)
+		expected1 := KeyUsageDigitalSignature | KeyUsageKeyEncipherment
+		if opt.RemoteCertKU[1] != expected1 {
+			t.Errorf("KU[1]: expected 0x%02x, got 0x%02x", expected1, opt.RemoteCertKU[1])
+		}
+		// 0x88 -> digitalSignature | keyAgreement (0x11)
+		expected2 := KeyUsageDigitalSignature | KeyUsageKeyAgreement
+		if opt.RemoteCertKU[2] != expected2 {
+			t.Errorf("KU[2]: expected 0x%02x, got 0x%02x", expected2, opt.RemoteCertKU[2])
+		}
+	})
+}
+
+// TestCompressionOpenVPN25Compliance tests that compression handling matches OpenVPN 2.5 behavior.
+// Reference: options.c:3838-3841, options.c:7916-7920, compstub.c
+func TestCompressionOpenVPN25Compliance(t *testing.T) {
+	t.Run("default compression is undefined (COMP_ALG_UNDEF)", func(t *testing.T) {
+		// OpenVPN 2.5: default comp.alg = COMP_ALG_UNDEF (0)
+		// options_string only outputs ",comp-lzo" when alg != UNDEF
+		l := []string{
+			"remote 0.0.0.0 1194",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.Compress != CompressionUndef {
+			t.Errorf("expected Compress=CompressionUndef, got %q", opt.Compress)
+		}
+
+		// OCC string should NOT contain any compression marker
+		s := opt.ServerOptionsString()
+		if strings.Contains(s, "comp") {
+			t.Errorf("OCC string should not contain compression when undefined: %q", s)
+		}
+	})
+
+	t.Run("compress (no args) equals COMP_ALG_STUB + COMP_F_SWAP", func(t *testing.T) {
+		// OpenVPN 2.5 options.c:7916-7920:
+		// "compress" with no argument sets COMP_ALG_STUB + COMP_F_SWAP
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"compress",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.Compress != CompressionStub {
+			t.Errorf("expected Compress=CompressionStub, got %q", opt.Compress)
+		}
+
+		// OCC string should contain ",comp-lzo" (OpenVPN compatibility)
+		s := opt.ServerOptionsString()
+		if !strings.Contains(s, ",comp-lzo") {
+			t.Errorf("OCC string should contain ,comp-lzo: %q", s)
+		}
+	})
+
+	t.Run("compress stub equals COMP_ALG_STUB + COMP_F_SWAP", func(t *testing.T) {
+		// OpenVPN 2.5 options.c:7875-7878
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"compress stub",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.Compress != CompressionStub {
+			t.Errorf("expected Compress=CompressionStub, got %q", opt.Compress)
+		}
+
+		// OCC string should contain ",comp-lzo"
+		s := opt.ServerOptionsString()
+		if !strings.Contains(s, ",comp-lzo") {
+			t.Errorf("OCC string should contain ,comp-lzo: %q", s)
+		}
+	})
+
+	t.Run("comp-lzo no sets CompressionLZONo", func(t *testing.T) {
+		l := []string{
+			"remote 0.0.0.0 1194",
+			"comp-lzo no",
+		}
+		opt, err := getOptionsFromLines(l, t.TempDir())
+		if err != nil {
+			t.Fatalf("getOptionsFromLines: %v", err)
+		}
+		if opt.Compress != CompressionLZONo {
+			t.Errorf("expected Compress=CompressionLZONo, got %q", opt.Compress)
+		}
+
+		// OCC string should contain ",comp-lzo"
+		s := opt.ServerOptionsString()
+		if !strings.Contains(s, ",comp-lzo") {
+			t.Errorf("OCC string should contain ,comp-lzo: %q", s)
+		}
+	})
+
+	t.Run("OCC string uses ,comp-lzo for all compression modes", func(t *testing.T) {
+		// OpenVPN 2.5 options.c:3838-3841 comment:
+		// "for compatibility, this simply indicates that compression context is active,
+		// not necessarily LZO per-se"
+		testCases := []struct {
+			name     string
+			compress Compression
+		}{
+			{"stub", CompressionStub},
+			{"lzo-no", CompressionLZONo},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				opt := &OpenVPNOptions{
+					Compress: tc.compress,
+				}
+				s := opt.ServerOptionsString()
+				if !strings.HasSuffix(s, ",comp-lzo") {
+					t.Errorf("OCC string should end with ,comp-lzo for %s: %q", tc.name, s)
+				}
+				// Should NOT contain the specific mode (e.g., "compress stub")
+				if strings.Contains(s, ",compress ") {
+					t.Errorf("OCC string should not contain specific compress mode: %q", s)
+				}
+			})
+		}
+	})
+
+	t.Run("CompressionUndef produces no compression in OCC string", func(t *testing.T) {
+		opt := &OpenVPNOptions{
+			Compress: CompressionUndef,
+		}
+		s := opt.ServerOptionsString()
+		if strings.Contains(s, "comp") {
+			t.Errorf("OCC string should not contain any compression marker for UNDEF: %q", s)
 		}
 	})
 }

@@ -67,8 +67,14 @@ func main() {
 	log.SetHandler(NewHandler(os.Stderr))
 	log.SetLevel(log.DebugLevel)
 
+	configBytes, err := os.ReadFile(cfg.configPath)
+	if err != nil {
+		log.WithError(err).Error("cannot read config")
+		os.Exit(1)
+	}
+
 	opts := []config.Option{
-		config.WithConfigFile(cfg.configPath),
+		config.WithConfigBytes(configBytes),
 		config.WithLogger(log.Log),
 	}
 

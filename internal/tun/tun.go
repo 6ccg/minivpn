@@ -17,34 +17,48 @@ import (
 )
 
 var (
-	// default TLS handshake timeout, in seconds.
-	tlsHandshakeTimeoutSeconds = 60
-
 	// ErrCannotHandshake is the generic error we return when we cannot complete a handshake.
 	ErrCannotHandshake = errors.New("openvpn handshake error")
 )
 
+type handshakeError struct {
+	cause error
+}
+
+func (e handshakeError) Error() string {
+	return fmt.Sprintf("%v: %v", ErrCannotHandshake, e.cause)
+}
+
+func (e handshakeError) Unwrap() []error {
+	return []error{ErrCannotHandshake, e.cause}
+}
+
 // StartTUN initializes and starts the TUN device over the vpn.
 // If the passed context expires before the TUN device is ready,
 // an error will be returned.
-func StartTUN(ctx context.Context, conn networkio.FramingConn, config *config.Config) (*TUN, error) {
+func StartTUN(ctx context.Context, conn networkio.FramingConn, cfg *config.Config) (*TUN, error) {
 	// create a session
-	sessionManager, err := session.NewManager(config)
+	sessionManager, err := session.NewManager(cfg)
 	if err != nil {
 		return nil, err
 	}
 
 	// create the TUN that will OWN the connection
-	tunnel := newTUN(config.Logger(), conn, sessionManager)
+	tunnel := newTUN(cfg.Logger(), conn, sessionManager)
 
 	// start all the workers
-	workers := startWorkers(config, conn, sessionManager, tunnel)
+	workers := startWorkers(cfg, conn, sessionManager, tunnel)
 	tunnel.whenDone(func() {
 		workers.StartShutdown()
 		workers.WaitWorkersShutdown()
 	})
-
-	tlsTimeout := time.NewTimer(time.Duration(tlsHandshakeTimeoutSeconds) * time.Second)
+	// Ensure we close the TUN (and underlying conn) when any worker triggers shutdown.
+	// Without this, a ping-exit/ping-restart or any internal fatal condition could stop
+	// workers but leave the TUN open, causing callers to block indefinitely.
+	go func() {
+		<-workers.ShouldShutdown()
+		_ = tunnel.Close()
+	}()
 
 	// Await for the signal from the session manager to tell us we're ready to start accepting data.
 	// In practice, this means that we already have a valid TunnelInfo at this point
@@ -54,23 +68,16 @@ func StartTUN(ctx context.Context, conn networkio.FramingConn, config *config.Co
 	case <-sessionManager.Ready:
 		return tunnel, nil
 	case failure := <-sessionManager.Failure:
-		err := fmt.Errorf("%w: %s", ErrCannotHandshake, failure)
+		err := handshakeError{cause: failure}
 		defer func() {
-			config.Logger().Warn(err.Error())
-			tunnel.Close()
-		}()
-		return nil, err
-	case <-tlsTimeout.C:
-		err := fmt.Errorf("%w: %s", ErrCannotHandshake, "tls timeout")
-		defer func() {
-			config.Logger().Warn(err.Error())
+			cfg.Logger().Warn(err.Error())
 			tunnel.Close()
 		}()
 		return nil, err
 	case <-ctx.Done():
-		err := fmt.Errorf("%w: %w", ErrCannotHandshake, ctx.Err())
+		err := handshakeError{cause: ctx.Err()}
 		defer func() {
-			config.Logger().Warn(err.Error())
+			cfg.Logger().Warn(err.Error())
 			tunnel.Close()
 		}()
 		return nil, err

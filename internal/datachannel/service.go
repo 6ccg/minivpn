@@ -16,11 +16,6 @@ import (
 	"github.com/ooni/minivpn/pkg/config"
 )
 
-// Default keepalive interval in seconds.
-// OpenVPN servers typically use ping/ping-restart of 10/60 or 10/120.
-// We use 10 seconds as the default ping interval.
-const defaultKeepaliveInterval = 10 * time.Second
-
 var (
 	serviceName = "datachannel"
 
@@ -91,12 +86,10 @@ func (s *Service) StartWorkers(
 	// Get ping configuration from session manager
 	pingInterval, pingTimeout, pingTimeoutAction := sessionManager.PingConfig()
 
-	// Use configured ping interval or default (10s)
+	// pingInterval is 0 when ping is disabled (OpenVPN semantics).
 	var pingDuration time.Duration
 	if pingInterval > 0 {
 		pingDuration = time.Duration(pingInterval) * time.Second
-	} else {
-		pingDuration = defaultKeepaliveInterval
 	}
 
 	ws := &workersState{
@@ -140,7 +133,7 @@ type workersState struct {
 	// 锁顺序约定: 如果需要同时持有 dataChannelMu 和 session.Manager.mu，
 	// 必须先获取 dataChannelMu，再获取 Manager.mu，以避免死锁。
 	// 当前代码遵守此约定，参见 keyWorker() 实现。
-	dataChannelMu sync.RWMutex
+	dataChannelMu        sync.RWMutex
 	options              *config.OpenVPNOptions
 	dataOrControlToMuxer chan<- *model.Packet
 	dataToTUN            chan<- []byte
@@ -157,7 +150,7 @@ type workersState struct {
 	controlToReliable chan<- *model.Packet       // For sending SOFT_RESET packets
 
 	// Ping/keepalive configuration
-	pingInterval      time.Duration // Configured --ping interval (0 = use default)
+	pingInterval      time.Duration // Configured --ping interval (0 = disabled)
 	pingTimeout       time.Duration // Configured ping-restart or ping-exit timeout (0 = disabled)
 	pingTimeoutAction int           // Timeout action (from session.PingTimeoutAction*)
 }
@@ -217,8 +210,11 @@ func (ws *workersState) moveDownWorker(firstKeyReady <-chan any) {
 					continue
 				}
 
-				// Track bytes written for renegotiation
-				ws.sessionManager.AddDataChannelBytes(0, int64(len(packet.Payload)))
+				// Track bytes and packets written for renegotiation (per-key counters).
+				// Matches OpenVPN ssl.c:3889-3890 where ks->n_packets++ and ks->n_bytes
+				// are updated on the send path.
+				ws.sessionManager.AddKeyBytes(session.KS_PRIMARY, 0, int64(len(packet.Payload)))
+				ws.sessionManager.AddKeyPackets(session.KS_PRIMARY, 0, 1)
 
 				// Event-driven renegotiation check (matches OpenVPN ssl.c:2668-2684)
 				ws.checkRenegotiation()
@@ -341,8 +337,9 @@ func (ws *workersState) moveUpWorker(firstKeyReady <-chan any) {
 					continue
 				}
 
-				// Track bytes read for renegotiation
-				ws.sessionManager.AddDataChannelBytes(int64(len(pkt.Payload)), 0)
+				// Note: per-key byte/packet counters are updated inside ReadPacket()
+				// (controller.go:298-299) using AddKeyBytes/AddKeyPackets, which also
+				// update the legacy global counters for backward compatibility.
 
 				// Event-driven renegotiation check (matches OpenVPN ssl.c:2668-2684)
 				ws.checkRenegotiation()
@@ -397,7 +394,10 @@ func (ws *workersState) keyWorker(firstKeyReady chan<- any) {
 				ws.dataChannel = dc
 			}
 
-			err := ws.dataChannel.setupKeys(key)
+			// Use the current key_id (already advanced by KeySoftReset during rotation).
+			// This keeps data-channel key material aligned with the session manager.
+			keyID := ws.sessionManager.CurrentKeyID()
+			err := ws.dataChannel.SetupKeysForSlot(key, session.KS_PRIMARY, keyID)
 			ws.dataChannelMu.Unlock()
 
 			if err != nil {
@@ -418,8 +418,10 @@ func (ws *workersState) keyWorker(firstKeyReady chan<- any) {
 				ws.logger.Warnf("key rotation failed, continuing with current key")
 				continue
 			}
+			// Mark per-key state as established so DataKeyID() can correctly choose
+			// between primary and lame duck during rotation (OpenVPN 2.5 behavior).
+			ws.sessionManager.MarkPrimaryKeyEstablished()
 			ws.sessionManager.SetNegotiationState(model.S_GENERATED_KEYS)
-			ws.sessionManager.MarkKeyEstablished()
 			once.Do(func() {
 				close(firstKeyReady)
 			})
@@ -452,8 +454,41 @@ func (ws *workersState) keepaliveWorker(firstKeyReady <-chan any) {
 		// Initialize last packet time now that we have a working connection
 		ws.sessionManager.UpdateLastPacketTime()
 
-		pingTicker := time.NewTicker(ws.pingInterval)
-		defer pingTicker.Stop()
+		// Refresh ping configuration now that the control channel negotiation
+		// (including PUSH_REPLY) has completed and may have updated ping options.
+		pingIntervalSeconds, pingTimeoutSeconds, pingTimeoutAction := ws.sessionManager.PingConfig()
+		ws.pingTimeoutAction = pingTimeoutAction
+		ws.pingTimeout = time.Duration(pingTimeoutSeconds) * time.Second
+		if pingIntervalSeconds > 0 {
+			ws.pingInterval = time.Duration(pingIntervalSeconds) * time.Second
+		} else {
+			ws.pingInterval = 0
+		}
+
+		activityChan := ws.sessionManager.OutgoingPacketActivity()
+
+		// Ping send timer (optional; --ping may be disabled).
+		//
+		// OpenVPN 2.5 semantics: only send a ping when there has been no
+		// outgoing traffic for --ping seconds; any outgoing packet resets the
+		// timer (forward.c:1642 event_timeout_reset(&ping_send_interval)).
+		var pingTimer *time.Timer
+		var pingChan <-chan time.Time
+		resetPingTimer := func() {}
+		if ws.pingInterval > 0 {
+			pingTimer = time.NewTimer(ws.pingInterval)
+			defer pingTimer.Stop()
+			pingChan = pingTimer.C
+			resetPingTimer = func() {
+				if !pingTimer.Stop() {
+					select {
+					case <-pingTimer.C:
+					default:
+					}
+				}
+				pingTimer.Reset(ws.pingInterval)
+			}
+		}
 
 		// Timeout check ticker (separate from ping send)
 		var timeoutTicker *time.Ticker
@@ -471,21 +506,22 @@ func (ws *workersState) keepaliveWorker(firstKeyReady <-chan any) {
 
 		for {
 			select {
-			case <-pingTicker.C:
+			case <-activityChan:
+				resetPingTimer()
+
+			case <-pingChan:
 				// Send keepalive ping
 				ws.sendPing()
+				resetPingTimer()
 
 			case <-timeoutChan:
 				// Check for inactivity timeout
 				exceeded, action := ws.sessionManager.CheckPingTimeout()
 				if exceeded {
 					ws.handlePingTimeout(action)
-					if action == session.PingTimeoutActionExit {
-						return // Worker exits, shutdown will be triggered
-					}
-					// For restart, reset the last packet time so we don't
-					// immediately timeout again during renegotiation
-					ws.sessionManager.UpdateLastPacketTime()
+					// For ping-restart/ping-exit we shut down the tunnel.
+					// This matches OpenVPN's "restart the daemon" semantics.
+					return
 				}
 
 			case <-ws.workersManager.ShouldShutdown():
@@ -523,10 +559,13 @@ func (ws *workersState) sendPing() {
 func (ws *workersState) handlePingTimeout(action int) {
 	switch action {
 	case session.PingTimeoutActionRestart:
-		ws.logger.Warnf("keepalive: ping-restart timeout, triggering SOFT_RESET")
-		if err := ws.triggerRenegotiation(); err != nil {
-			ws.logger.Warnf("keepalive: failed to trigger renegotiation: %v", err)
+		ws.logger.Warnf("keepalive: ping-restart timeout, restarting tunnel")
+		// Best-effort error reporting; channel may be unbuffered/unread.
+		select {
+		case ws.sessionManager.Failure <- ErrPingTimeout:
+		default:
 		}
+		ws.workersManager.StartShutdown()
 
 	case session.PingTimeoutActionExit:
 		ws.logger.Warnf("keepalive: ping-exit timeout, shutting down connection")
@@ -640,10 +679,9 @@ func (ws *workersState) checkRenegotiation() {
 
 // triggerRenegotiation initiates a client-side key renegotiation by:
 // 1. Performing a soft reset (moving current key to lame duck slot)
-// 2. Advancing the key ID for the new session
-// 3. Sending a P_CONTROL_SOFT_RESET_V1 packet
-// 4. Setting the negotiation state to S_INITIAL
-// 5. Notifying the TLS layer to perform a new handshake
+// 2. Sending a P_CONTROL_SOFT_RESET_V1 packet
+// 3. Setting the negotiation state to S_INITIAL
+// 4. Notifying the TLS layer to perform a new handshake
 func (ws *workersState) triggerRenegotiation() error {
 	// Check if we have the required channels
 	if ws.controlToReliable == nil {
@@ -660,10 +698,11 @@ func (ws *workersState) triggerRenegotiation() error {
 		return fmt.Errorf("key soft reset failed: %w", err)
 	}
 
-	// Advance the key ID for the new key negotiation.
-	// This follows OpenVPN's key_id cycling: 0→1→2→...→7→1→...
-	newKeyID := ws.sessionManager.NextKeyID()
-	ws.logger.Debugf("renegotiation: advanced to key_id=%d", newKeyID)
+	// KeySoftReset already advances the key ID (matching OpenVPN's
+	// key_state_soft_reset() -> key_state_init() behavior), so we must NOT call
+	// NextKeyID() again here.
+	newKeyID := ws.sessionManager.CurrentKeyID()
+	ws.logger.Debugf("renegotiation: new key_id=%d", newKeyID)
 
 	// Create a SOFT_RESET packet (will use the new key ID)
 	packet, err := ws.sessionManager.NewPacket(model.P_CONTROL_SOFT_RESET_V1, []byte{})

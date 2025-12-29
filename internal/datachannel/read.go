@@ -89,6 +89,75 @@ func decodeEncryptedPayloadAEAD(log model.Logger, buf []byte, session *session.M
 	return encrypted, nil
 }
 
+func decodeEncryptedPayloadAEADWithKeyMaterial(log model.Logger, buf []byte, session *session.Manager, state *dataChannelState, km *KeyMaterial) (*encryptedData, error) {
+	//   P_DATA_V2 GCM data channel crypto format
+	//   48000001 00000005 7e7046bd 444a7e28 cc6387b1 64a4d6c1 380275a...
+	//   [ OP32 ] [seq # ] [             auth tag            ] [ payload ... ]
+	//   - means authenticated -    * means encrypted *
+	//   [ - opcode/peer-id - ] [ - packet ID - ] [ TAG ] [ * packet payload * ]
+
+	// Preconditions
+	runtimex.Assert(state != nil, "passed nil state")
+	runtimex.Assert(state.dataCipher != nil, "data cipher not initialized")
+	runtimex.Assert(km != nil, "passed nil key material")
+
+	if len(buf) == 0 || len(buf) < 20 {
+		return &encryptedData{}, fmt.Errorf("%w: %d bytes", ErrTooShort, len(buf))
+	}
+
+	hmacKeyRemote := km.GetHmacKeyRemote()
+	remoteHMAC := hmacKeyRemote[:8]
+
+	// Extract packet_id for replay protection
+	// Note: replay check is performed AFTER successful decryption, following
+	// OpenVPN official behavior (crypto.c:openvpn_decrypt_aead L465).
+	// This prevents attackers from polluting the replay window with forged packets.
+	packetIDBytes := buf[:4]
+	packetID := model.PacketID(binary.BigEndian.Uint32(packetIDBytes))
+
+	// Build headers directly into scratch buffer (no allocation)
+	headerLen := 1 + 4 // opcode/key + packet_id
+	if dataOpcode(session) == model.P_DATA_V2 {
+		headerLen += 3 // peer_id
+	}
+
+	headers := state.scratchAEADRemote[:headerLen]
+	offset := 0
+	headers[offset] = byte((byte(dataOpcode(session)) << 3) | (km.KeyID() & 0x07))
+	offset++
+	if dataOpcode(session) == model.P_DATA_V2 {
+		peerID := uint32(session.TunnelInfo().PeerID)
+		headers[offset] = byte(peerID >> 16)
+		headers[offset+1] = byte(peerID >> 8)
+		headers[offset+2] = byte(peerID)
+		offset += 3
+	}
+	copy(headers[offset:], packetIDBytes)
+
+	// Swap tag|payload -> payload|tag using pooled buffer
+	// ciphertext starts at buf[20:], tag is at buf[4:20]
+	ciphertextLen := len(buf) - 20
+	payloadLen := ciphertextLen + 16 // ciphertext + tag
+
+	payload := defaultSlicePool.getSlice(payloadLen)
+	copy(payload[:ciphertextLen], buf[20:])  // ciphertext
+	copy(payload[ciphertextLen:], buf[4:20]) // tag
+
+	// Build IV directly into scratch buffer (no allocation)
+	// iv := packetID | remoteHMAC
+	iv := state.scratchIVRemote[:]
+	copy(iv[:4], packetIDBytes)
+	copy(iv[4:], remoteHMAC)
+
+	encrypted := &encryptedData{
+		iv:         iv,
+		ciphertext: payload,
+		aead:       headers,
+		packetID:   packetID,
+	}
+	return encrypted, nil
+}
+
 var ErrCannotDecode = errors.New("cannot decode")
 
 func decodeEncryptedPayloadNonAEAD(log model.Logger, buf []byte, session *session.Manager, state *dataChannelState) (*encryptedData, error) {
@@ -126,6 +195,46 @@ func decodeEncryptedPayloadNonAEAD(log model.Logger, buf []byte, session *sessio
 	return encrypted, nil
 }
 
+func decodeEncryptedPayloadNonAEADWithKeyMaterial(log model.Logger, buf []byte, session *session.Manager, state *dataChannelState, km *KeyMaterial) (*encryptedData, error) {
+	runtimex.Assert(state != nil, "passed nil state")
+	runtimex.Assert(state.dataCipher != nil, "data cipher not initialized")
+	runtimex.Assert(km != nil, "passed nil key material")
+
+	hmacRemote := km.HmacRemote()
+	if hmacRemote == nil {
+		return &encryptedData{}, ErrBadRemoteHMAC
+	}
+
+	hashSize := uint8(hmacRemote.Size())
+	blockSize := state.dataCipher.blockSize()
+
+	minLen := hashSize + blockSize
+	if len(buf) < int(minLen) {
+		return &encryptedData{}, fmt.Errorf("%w: too short (%d bytes)", ErrCannotDecode, len(buf))
+	}
+
+	receivedHMAC := buf[:hashSize]
+	iv := buf[hashSize : hashSize+blockSize]
+	cipherText := buf[hashSize+blockSize:]
+
+	hmacRemote.Reset()
+	hmacRemote.Write(iv)
+	hmacRemote.Write(cipherText)
+	computedHMAC := hmacRemote.Sum(nil)
+
+	if !hmac.Equal(computedHMAC, receivedHMAC) {
+		log.Warnf("expected: %x, got: %x", computedHMAC, receivedHMAC)
+		return &encryptedData{}, fmt.Errorf("%w: %s", ErrCannotDecrypt, ErrBadHMAC)
+	}
+
+	encrypted := &encryptedData{
+		iv:         iv,
+		ciphertext: cipherText,
+		aead:       []byte{}, // no AEAD data in this mode, leaving it empty to satisfy common interface
+	}
+	return encrypted, nil
+}
+
 // maybeDecompress de-serializes the data from the payload according to the framing
 // given by different compression methods. only the different no-compression
 // modes are supported at the moment, so no real decompression is done. It
@@ -147,7 +256,7 @@ func maybeDecompress(b []byte, st *dataChannelState, opt *config.OpenVPNOptions)
 		// AEAD mode: replay check was already done in decodeEncryptedPayloadAEAD
 		// The decrypted payload does not contain packet_id
 		switch opt.Compress {
-		case config.CompressionStub, config.CompressionLZONo:
+		case config.CompressionStub, config.CompressionLZONo, config.CompressionEmpty:
 			// these are deprecated in openvpn 2.5.x
 			compr = b[0]
 			payload = b[1:]
@@ -168,7 +277,7 @@ func maybeDecompress(b []byte, st *dataChannelState, opt *config.OpenVPNOptions)
 		}
 
 		switch opt.Compress {
-		case config.CompressionStub, config.CompressionLZONo:
+		case config.CompressionStub, config.CompressionLZONo, config.CompressionEmpty:
 			compr = b[4]
 			payload = b[5:]
 		default:
@@ -194,5 +303,52 @@ func maybeDecompress(b []byte, st *dataChannelState, opt *config.OpenVPNOptions)
 	default:
 		return []byte{}, fmt.Errorf("%w: cannot handle compression %x", errBadCompression, compr)
 	}
+	return payload, nil
+}
+
+// maybeDecompressNonAEADNoReplay is like maybeDecompress for the non-AEAD path,
+// but it assumes replay protection has already been handled (e.g. per-key).
+//
+// This is required for correct key rotation because each key_state must keep
+// an independent replay window; using the shared state replay filter would
+// cause false replays when two keys are valid in transition-window.
+func maybeDecompressNonAEADNoReplay(b []byte, opt *config.OpenVPNOptions) ([]byte, error) {
+	if opt == nil {
+		return []byte{}, fmt.Errorf("%w:%s", ErrBadInput, "bad options")
+	}
+	// Decrypted payload must include packet_id (4 bytes) at the beginning.
+	if len(b) < 4 {
+		return []byte{}, fmt.Errorf("%w: payload too short for packet_id", ErrBadInput)
+	}
+
+	var compr byte
+	var payload []byte
+
+	switch opt.Compress {
+	case config.CompressionStub, config.CompressionLZONo, config.CompressionEmpty:
+		if len(b) < 5 {
+			return []byte{}, fmt.Errorf("%w: payload too short for compression byte", ErrBadInput)
+		}
+		compr = b[4]
+		payload = b[5:]
+	default:
+		compr = 0x00
+		payload = b[4:]
+	}
+
+	switch compr {
+	case 0xfb:
+		// compression stub swap:
+		// we get the last byte and replace the compression byte
+		// these are deprecated in openvpn 2.5.x
+		end := payload[len(payload)-1]
+		rest := payload[:len(payload)-1]
+		payload = append([]byte{end}, rest...)
+	case 0x00, 0xfa:
+		// do nothing
+	default:
+		return []byte{}, fmt.Errorf("%w: cannot handle compression %x", errBadCompression, compr)
+	}
+
 	return payload, nil
 }

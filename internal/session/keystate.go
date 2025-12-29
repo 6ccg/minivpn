@@ -17,7 +17,7 @@ const (
 
 	// DefaultTransitionWindow is how long (seconds) a lame duck key stays alive
 	// after a soft reset. This corresponds to OpenVPN's --transition-window option.
-	DefaultTransitionWindow = 60
+	DefaultTransitionWindow = 3600
 )
 
 // KeyState represents a data channel key with its lifecycle state.
@@ -59,6 +59,16 @@ type KeyState struct {
 
 	// RemoteSessionID is the peer's session ID associated with this key
 	RemoteSessionID model.SessionID
+
+	// localDataPacketID is the next packet-id to use for outbound data-channel
+	// packets sent with this key.
+	//
+	// OpenVPN rejects packet-id 0, so the first outbound packet-id is 1.
+	localDataPacketID model.PacketID
+
+	// dataPacketIDWrapTriggered indicates we already warned that packet-id is
+	// close to wrapping for this key.
+	dataPacketIDWrapTriggered bool
 }
 
 // IsExpired returns true if the key has passed its must_die time.
@@ -119,6 +129,8 @@ func (ks *KeyState) Reset() {
 	ks.PacketsRead = 0
 	ks.PacketsWritten = 0
 	ks.RemoteSessionID = model.SessionID{}
+	ks.localDataPacketID = 0
+	ks.dataPacketIDWrapTriggered = false
 }
 
 // TimeUntilExpiry returns the duration until this key expires.
@@ -141,7 +153,8 @@ func (ks *KeyState) IsNegotiationTimedOut() bool {
 		return false
 	}
 	// Only timeout if we haven't completed negotiation yet
-	if ks.State >= model.S_GENERATED_KEYS {
+	// This matches OpenVPN's check: ks->state < S_ACTIVE (ssl.c:2747)
+	if ks.State >= model.S_ACTIVE {
 		return false
 	}
 	return time.Now().After(ks.MustNegotiate)
@@ -157,7 +170,7 @@ func (ks *KeyState) SetNegotiationDeadline(handshakeWindow time.Duration) {
 }
 
 // ClearNegotiationDeadline clears the must_negotiate deadline.
-// Call this when negotiation completes successfully (state reaches S_ACTIVE/S_GENERATED_KEYS).
+// Call this when negotiation completes successfully (state reaches S_ACTIVE).
 // This matches OpenVPN's ks->must_negotiate = 0 in ssl.c:2793.
 func (ks *KeyState) ClearNegotiationDeadline() {
 	if ks == nil {

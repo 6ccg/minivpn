@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -32,11 +33,15 @@ func encodeClientControlMessageAsBytes(k *session.KeySource, o *config.OpenVPNOp
 	if err != nil {
 		return nil, err
 	}
-	user, err := bytesx.EncodeOptionStringToBytes(string(o.Username))
+	username, password, err := o.AuthUserPassSetup()
 	if err != nil {
 		return nil, err
 	}
-	pass, err := bytesx.EncodeOptionStringToBytes(string(o.Password))
+	user, err := bytesx.EncodeOptionStringToBytes(username)
+	if err != nil {
+		return nil, err
+	}
+	pass, err := bytesx.EncodeOptionStringToBytes(password)
 	if err != nil {
 		return nil, err
 	}
@@ -49,9 +54,22 @@ func encodeClientControlMessageAsBytes(k *session.KeySource, o *config.OpenVPNOp
 	out.Write(user)
 	out.Write(pass)
 
-	// Peer info fields needed for server compatibility, especially NCP negotiation
-	rawInfo := fmt.Sprintf("IV_VER=%s\nIV_PROTO=%s\nIV_NCP=2\nIV_CIPHERS=AES-256-GCM:AES-128-GCM:AES-256-CBC\nIV_PLAT=win\n", ivVer, ivProto)
-	peerInfo, _ := bytesx.EncodeOptionStringToBytes(rawInfo)
+	o.PurgeAuthUserPass()
+
+	// Peer info fields needed for server compatibility, especially NCP negotiation.
+	// These fields match OpenVPN 2.5's peer-info generation (ssl.c:2274, comp.c:150-174).
+	rawInfo := fmt.Sprintf(
+		"IV_VER=%s\nIV_PROTO=%s\nIV_NCP=2\nIV_CIPHERS=%s\nIV_PLAT=%s\n%s",
+		ivVer,
+		ivProto,
+		ivCiphers(o),
+		ivPlat(),
+		ivCompInfo(o),
+	)
+	peerInfo, err := bytesx.EncodeOptionStringToBytes(rawInfo)
+	if err != nil {
+		return nil, err
+	}
 	out.Write(peerInfo)
 	return out.Bytes(), nil
 }
@@ -59,8 +77,67 @@ func encodeClientControlMessageAsBytes(k *session.KeySource, o *config.OpenVPNOp
 // controlMessageHeader is the header prefixed to control messages
 var controlMessageHeader = []byte{0x00, 0x00, 0x00, 0x00}
 
-const ivVer = "2.5.5" // OpenVPN version compat that we declare to the server
-const ivProto = "6"   // IV_PROTO: DATA_V2 (2) + REQUEST_PUSH (4) - compatible with OpenVPN 2.4/2.5
+const ivVer = "2.5.11" // OpenVPN 2.5.x (matches `.openvpn-ref/`)
+const ivProto = "6"    // IV_PROTO: DATA_V2 (2) + REQUEST_PUSH (4) - compatible with OpenVPN 2.4/2.5
+const defaultNCPCiphers = "AES-256-GCM:AES-128-GCM"
+
+func ivPlat() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "win"
+	case "linux":
+		return "linux"
+	case "darwin":
+		return "mac"
+	case "freebsd":
+		return "freebsd"
+	case "netbsd":
+		return "netbsd"
+	case "openbsd":
+		return "openbsd"
+	case "solaris":
+		return "solaris"
+	case "android":
+		return "android"
+	default:
+		return runtime.GOOS
+	}
+}
+
+func ivCiphers(o *config.OpenVPNOptions) string {
+	if o == nil {
+		return defaultNCPCiphers
+	}
+	ciphers := defaultNCPCiphers
+	cipher := strings.TrimSpace(o.Cipher)
+	if cipher == "" {
+		return ciphers
+	}
+	for _, item := range strings.Split(ciphers, ":") {
+		if item == cipher {
+			return ciphers
+		}
+	}
+	return ciphers + ":" + cipher
+}
+
+// ivCompInfo returns the compression capability peer-info fields.
+// This matches OpenVPN 2.5's comp_generate_peer_info_string() in comp.c:150-174.
+// These fields inform the server what compression methods the client supports.
+func ivCompInfo(o *config.OpenVPNOptions) string {
+	// minivpn supports stub compression (COMP_ALG_STUB) which uses:
+	// - IV_COMP_STUB=1: supports stub compression with swap (0xFB)
+	// - IV_COMP_STUBv2=1: supports stub compression v2
+	// - IV_TCPNL=1: supports TCP non-linear (compression framing over TCP)
+	// - IV_LZO_STUB=1: only if comp-lzo is configured (we don't fully support LZO)
+	//
+	// Reference: .openvpn-ref/src/openvpn/comp.c:150-174
+	var b strings.Builder
+	b.WriteString("IV_COMP_STUB=1\n")
+	b.WriteString("IV_COMP_STUBv2=1\n")
+	b.WriteString("IV_TCPNL=1\n")
+	return b.String()
+}
 
 // errMissingHeader indicates that we're missing the four-byte all-zero header.
 var errMissingHeader = errors.New("missing four-byte all-zero header")

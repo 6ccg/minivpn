@@ -23,13 +23,17 @@ var (
 
 	// ErrNoRemoteSessionID indicates we are missing the remote session ID.
 	ErrNoRemoteSessionID = errors.New("missing remote session ID")
+
+	// ErrTLSNegotiationTimeout indicates TLS key negotiation exceeded hand-window.
+	// This mirrors OpenVPN's "TLS key negotiation failed to occur within ..." failure.
+	ErrTLSNegotiationTimeout = errors.New("TLS key negotiation timeout")
 )
 
 // Ping timeout action constants
 const (
 	// PingTimeoutActionNone indicates no action on timeout (disabled)
 	PingTimeoutActionNone = 0
-	// PingTimeoutActionRestart indicates restart/renegotiate on timeout (ping-restart)
+	// PingTimeoutActionRestart indicates restart on timeout (ping-restart).
 	PingTimeoutActionRestart = 1
 	// PingTimeoutActionExit indicates exit on timeout (ping-exit)
 	PingTimeoutActionExit = 2
@@ -41,22 +45,30 @@ type Manager struct {
 	keyID                uint8
 	keys                 []*DataChannelKey
 	localControlPacketID model.PacketID
-	localDataPacketID    model.PacketID
-	localSessionID       model.SessionID
-	logger               model.Logger
+	// controlEpoch increments whenever control-channel sequencing state is reset
+	// (e.g., SOFT_RESET/new key_state). It allows downstream layers such as the
+	// reliable transport to reset their per-session queues/counters.
+	controlEpoch   uint64
+	localSessionID model.SessionID
+	logger         model.Logger
 	// mu 保护 Manager 的所有可变状态。
 	// 锁顺序约定: 如果需要同时持有 datachannel.workersState.dataChannelMu 和此锁，
 	// 必须先获取 dataChannelMu，再获取此锁，以避免死锁。
-	mu sync.RWMutex
-	negState             model.NegotiationState
-	dataOpcode           model.Opcode
-	remoteSessionID      optional.Value[model.SessionID]
-	tunnelInfo           model.TunnelInfo
-	tracer               model.HandshakeTracer
+	mu              sync.RWMutex
+	negState        model.NegotiationState
+	dataOpcode      model.Opcode
+	remoteSessionID optional.Value[model.SessionID]
+	tunnelInfo      model.TunnelInfo
+	tracer          model.HandshakeTracer
 
 	// Additional state required to support tls-auth
 	controlChannelSecurity     *wire.ControlChannelSecurity
 	localControlReplayPacketID model.PacketID
+	// controlReplayTimestamp is the epoch timestamp for control channel replay protection.
+	// Following OpenVPN 2.5 packet_id_send semantics: this is set once at epoch start
+	// and only updated on packet-id rollover, NOT refreshed on every packet.
+	// See .openvpn-ref/src/openvpn/packet_id.c:packet_id_send_update().
+	controlReplayTimestamp model.PacketTimestamp
 
 	// controlReplayFilter detects replay attacks on the control channel.
 	// This is used to validate incoming ReplayPacketID and Timestamp fields.
@@ -110,7 +122,7 @@ type Manager struct {
 	lastPacketTime time.Time
 
 	// pingSeconds is the configured --ping interval in seconds.
-	// 0 means use default (10 seconds).
+	// 0 means disabled.
 	pingSeconds int
 
 	// pingRestartSeconds is the configured --ping-restart timeout in seconds.
@@ -126,18 +138,25 @@ type Manager struct {
 	// Used to set must_negotiate deadline on key states.
 	handshakeWindow time.Duration
 
-	// dataPacketIDWrapTriggered indicates that the data packet ID has reached
-	// the wrap trigger threshold (0xFF000000) and a soft reset should be initiated.
-	// This matches OpenVPN's packet_id_close_to_wrapping() check in packet_id.h:310-314.
-	// Reset after key rotation completes.
-	dataPacketIDWrapTriggered bool
+	// outgoingPacketActivity is notified whenever we successfully send a packet
+	// to the network. This is used by the ping/keepalive implementation to
+	// match OpenVPN 2.5 behavior where any outgoing packet resets the ping send
+	// timer (forward.c:1642 event_timeout_reset(&ping_send_interval)).
+	outgoingPacketActivity chan struct{}
 }
 
 // NewManager returns a [Manager] ready to be used.
-func NewManager(config *config.Config) (*Manager, error) {
+func NewManager(cfg *config.Config) (*Manager, error) {
 	key0 := &DataChannelKey{}
 
-	opts := config.OpenVPNOptions()
+	opts := cfg.OpenVPNOptions()
+
+	pingSeconds := opts.Ping
+	pingRestartSeconds := opts.PingRestart
+	pingExitSeconds := opts.PingExit
+	if !opts.Proto.IsTCP() && pingRestartSeconds == 0 && pingExitSeconds == 0 {
+		pingRestartSeconds = config.PrePullInitialPingRestart
+	}
 
 	sessionManager := &Manager{
 		keyID: 0,
@@ -145,29 +164,22 @@ func NewManager(config *config.Config) (*Manager, error) {
 		// localControlPacketID should be initialized to 1 because we handle hard-reset as special cases
 		localControlPacketID: 1,
 		localSessionID:       [8]byte{},
-		logger:               config.Logger(),
+		logger:               cfg.Logger(),
 		mu:                   sync.RWMutex{},
-		negState:             0,
+		negState:             model.S_INITIAL,
 		dataOpcode:           0,
 		remoteSessionID:      optional.None[model.SessionID](),
 		tunnelInfo:           model.TunnelInfo{},
-		tracer:               config.Tracer(),
+		tracer:               cfg.Tracer(),
 
-		// Data channel packet ID starts at 1, matching official OpenVPN behavior.
-		// In OpenVPN's packet_id_send_update() (packet_id.c:326-346), the ID is initialized
-		// to 0 then incremented before first use, so the first sent packet has ID=1.
-		// Additionally, packet_id_test() explicitly rejects ID=0 as invalid.
-		localDataPacketID: 1,
-
-		// Initialize control channel replay filter with timestamp validation enabled.
+		// Initialize control channel replay filter (OpenVPN packet_id style).
 		// Uses UDP mode (backtrack enabled) since control packets may arrive out of order.
 		controlReplayFilter: replay.NewFilter(
 			replay.DefaultSeqBacktrack,
-			replay.WithTimestampValidation(replay.MaxTimestampDelta),
 			replay.WithBacktrackMode(true),
 		),
 
-		Ready:   make(chan any),
+		Ready:   make(chan any, 1),
 		Failure: make(chan error),
 
 		// Initialize renegotiation settings from config
@@ -175,16 +187,19 @@ func NewManager(config *config.Config) (*Manager, error) {
 		renegotiateBytes:   opts.RenegotiateBytes,
 		renegotiatePackets: opts.RenegotiatePackets,
 
-		// Initialize transition window for lame duck keys (default 60 seconds)
+		// Initialize transition window for lame duck keys (default 3600 seconds)
 		transitionWindow: time.Duration(opts.TransitionWindow) * time.Second,
 
 		// Initialize ping/keepalive settings from config
-		pingSeconds:        opts.Ping,
-		pingRestartSeconds: opts.PingRestart,
-		pingExitSeconds:    opts.PingExit,
+		pingSeconds:        pingSeconds,
+		pingRestartSeconds: pingRestartSeconds,
+		pingExitSeconds:    pingExitSeconds,
 
 		// Initialize handshake window for must_negotiate timeout (default 60 seconds)
 		handshakeWindow: time.Duration(opts.HandshakeWindow) * time.Second,
+
+		// Outgoing activity signal used by keepalive ping scheduling.
+		outgoingPacketActivity: make(chan struct{}, 1),
 	}
 
 	randomBytes, err := randomFn(8)
@@ -210,6 +225,8 @@ func NewManager(config *config.Config) (*Manager, error) {
 		Key:   key0,
 		KeyID: 0,
 		State: model.S_INITIAL,
+		// Data channel packet ID starts at 1, matching official OpenVPN behavior.
+		localDataPacketID: 1,
 	}
 
 	// Control channel security options.
@@ -223,24 +240,24 @@ func NewManager(config *config.Config) (*Manager, error) {
 			return sessionManager, err
 		}
 
-		// replay packet id starts at 1 but is offset here becuase the first packet is always a hard reset packet which is hardcoded to 1
-		sessionManager.localControlReplayPacketID = 2
+		// Replay packet ID starts at 1 (OpenVPN 2.5.x packet-id semantics).
+		sessionManager.localControlReplayPacketID = 1
 	} else if len(opts.TLSCrypt) != 0 {
 		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSCrypt(opts.TLSCrypt)
 		if err != nil {
 			return sessionManager, err
 		}
 
-		// replay packet id starts at 1 but is offset here becuase the first packet is always a hard reset packet which is hardcoded to 1
-		sessionManager.localControlReplayPacketID = 2
+		// Replay packet ID starts at 1 (OpenVPN 2.5.x packet-id semantics).
+		sessionManager.localControlReplayPacketID = 1
 	} else if len(opts.TLSCryptV2) != 0 {
 		sessionManager.controlChannelSecurity, err = wire.NewControlChannelSecurityTLSCryptV2(opts.TLSCryptV2)
 		if err != nil {
 			return sessionManager, err
 		}
 
-		// replay packet id starts at 1 but is offset here becuase the first packet is always a hard reset packet which is hardcoded to 1
-		sessionManager.localControlReplayPacketID = 2
+		// Replay packet ID starts at 1 (OpenVPN 2.5.x packet-id semantics).
+		sessionManager.localControlReplayPacketID = 1
 	} else {
 		sessionManager.controlChannelSecurity = &wire.ControlChannelSecurity{
 			Mode: wire.ControlSecurityModeNone,
@@ -270,11 +287,80 @@ func (m *Manager) RemoteSessionID() []byte {
 	return nil
 }
 
+// ControlEpoch returns the current control-channel epoch.
+func (m *Manager) ControlEpoch() uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.controlEpoch
+}
+
 // IsRemoteSessionIDSet returns whether we've set the remote session ID.
 func (m *Manager) IsRemoteSessionIDSet() bool {
 	defer m.mu.RUnlock()
 	m.mu.RLock()
 	return !m.remoteSessionID.IsNone()
+}
+
+// HardReset resets session-scoped state so the client can start a new session
+// ("hard reset" semantics).
+//
+// This keeps the local session ID stable while clearing the remote session ID
+// and resetting per-session counters and key material.
+func (m *Manager) HardReset() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Clear remote session ID so the next HARD_RESET_SERVER_V2 can install the new
+	// session ID via SetRemoteSessionID.
+	m.remoteSessionID = optional.None[model.SessionID]()
+
+	// Reset per-session counters. Control packet IDs start at 1.
+	m.keyID = 0
+	m.localControlPacketID = 1
+	m.localControlReplayPacketID = 0
+	// Reset epoch timestamp so it will be re-initialized on first packet send.
+	// This matches OpenVPN's behavior of starting a fresh packet_id_send epoch.
+	m.controlReplayTimestamp = 0
+	if m.controlChannelSecurity.Mode != wire.ControlSecurityModeNone {
+		m.localControlReplayPacketID = 1
+	}
+
+	m.controlEpoch++
+
+	// Reset replay protection for the new session.
+	m.controlReplayFilter.Reset()
+
+	// Reset negotiation/data channel state.
+	m.negState = model.S_INITIAL
+	m.dataOpcode = 0
+	m.tunnelInfo = model.TunnelInfo{}
+	m.renegotiationRequested = false
+	m.keyEstablishedTime = time.Time{}
+	m.dataChannelBytesRead = 0
+	m.dataChannelBytesWritten = 0
+	m.lastPacketTime = time.Time{}
+
+	// Reset key material and key slots.
+	key0 := &DataChannelKey{}
+	localKey, err := NewKeySource()
+	if err != nil {
+		return err
+	}
+	if err := key0.AddLocalKey(localKey); err != nil {
+		return err
+	}
+	m.keys = []*DataChannelKey{key0}
+	m.keySlots = [KS_SIZE]*KeyState{}
+	m.keySlots[KS_PRIMARY] = &KeyState{
+		Key:   key0,
+		KeyID: 0,
+		State: model.S_INITIAL,
+		// Data channel packet ID starts at 1, matching official OpenVPN behavior.
+		localDataPacketID: 1,
+	}
+	m.keySlots[KS_LAME_DUCK] = nil
+
+	return nil
 }
 
 // NewACKForPacketIDs creates a new ACK for the given packet IDs.
@@ -294,15 +380,6 @@ func (m *Manager) NewACKForPacketIDs(ids []model.PacketID) (*model.Packet, error
 		RemoteSessionID: m.remoteSessionID.Unwrap(),
 		ID:              0,
 		Payload:         []byte{},
-	}
-
-	if m.controlChannelSecurity.Mode != wire.ControlSecurityModeNone {
-		replayId, err := m.localControlReplayPacketIDLocked()
-		if err != nil {
-			return nil, err
-		}
-		p.ReplayPacketID = replayId
-		p.Timestamp = model.PacketTimestamp(time.Now().Unix())
 	}
 	return p, nil
 }
@@ -330,16 +407,42 @@ func (m *Manager) NewPacket(opcode model.Opcode, payload []byte) (*model.Packet,
 	if !m.remoteSessionID.IsNone() {
 		packet.RemoteSessionID = m.remoteSessionID.Unwrap()
 	}
-
-	if m.controlChannelSecurity.Mode != wire.ControlSecurityModeNone {
-		replayId, err := m.localControlReplayPacketIDLocked()
-		if err != nil {
-			return nil, err
-		}
-		packet.ReplayPacketID = replayId
-		packet.Timestamp = model.PacketTimestamp(time.Now().Unix())
-	}
 	return packet, nil
+}
+
+// RefreshControlReplayProtection refreshes the (ReplayPacketID, Timestamp) pair on the
+// given packet.
+//
+// OpenVPN writes a fresh packet-id at the tls-auth/tls-crypt layer at send time and
+// does so also on retransmission, so reliable retransmits must refresh these anti-replay fields.
+//
+// IMPORTANT: Following OpenVPN 2.5 packet_id_send semantics (packet_id.c:326-346):
+// - The packet ID increments on every send
+// - The timestamp is set ONCE at epoch start and only updated on ID rollover
+// - This prevents time-backtrack rejection on the peer when packets arrive out-of-order
+func (m *Manager) RefreshControlReplayProtection(packet *model.Packet) error {
+	defer m.mu.Unlock()
+	m.mu.Lock()
+
+	if m.controlChannelSecurity == nil || m.controlChannelSecurity.Mode == wire.ControlSecurityModeNone {
+		return nil
+	}
+
+	// Initialize epoch timestamp if not set (first packet of this epoch).
+	// This matches OpenVPN's packet_id_send_update: "if (!p->time) p->time = now;"
+	if m.controlReplayTimestamp == 0 {
+		m.controlReplayTimestamp = model.PacketTimestamp(time.Now().Unix())
+	}
+
+	replayID, err := m.localControlReplayPacketIDLocked()
+	if err != nil {
+		return err
+	}
+	packet.ReplayPacketID = replayID
+	// Use the epoch timestamp, NOT current time.
+	// This matches OpenVPN's behavior where packet_id_send.time is stable within an epoch.
+	packet.Timestamp = m.controlReplayTimestamp
+	return nil
 }
 
 // NewHardResetPacket creates a new hard reset packet for this session.
@@ -363,11 +466,6 @@ func (m *Manager) NewHardResetPacket() *model.Packet {
 	packet.ID = 0
 	copy(packet.LocalSessionID[:], m.localSessionID[:])
 
-	// additional fields required by tls-auth mode
-	if m.controlChannelSecurity.Mode != wire.ControlSecurityModeNone {
-		packet.Timestamp = model.PacketTimestamp(time.Now().Unix())
-		packet.ReplayPacketID = 1 // Always 1 for a reset???
-	}
 	return packet
 }
 
@@ -379,10 +477,42 @@ func (m *Manager) LocalDataPacketID() (model.PacketID, error) {
 	return m.localDataPacketIDLocked()
 }
 
+// LocalDataPacketIDAndKeyID returns the next outbound data-channel packet ID
+// and the corresponding key ID used to protect the packet.
+//
+// This mirrors OpenVPN's behavior of selecting a single key_state for outbound
+// data during key rotation (lame duck handling) and then using that same state
+// for both packet_id and key_id.
+func (m *Manager) LocalDataPacketIDAndKeyID() (model.PacketID, uint8, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	ks := m.dataKeyStateLocked()
+	if ks == nil {
+		return 0, 0, errors.New("session: no data key state")
+	}
+	pid, err := m.localDataPacketIDLocked()
+	if err != nil {
+		return 0, 0, err
+	}
+	return pid, ks.KeyID, nil
+}
+
 // localDataPacketIDLocked returns an unique Packet ID for the Data Channel. It
 // increments the counter for the local data packet ID.
 func (m *Manager) localDataPacketIDLocked() (model.PacketID, error) {
-	pid := m.localDataPacketID
+	ks := m.dataKeyStateLocked()
+	if ks == nil {
+		return 0, errors.New("session: no data key state")
+	}
+
+	// Defensive: callers/tests might construct a KeyState without initializing
+	// the per-key counter. OpenVPN rejects packet-id 0, so start at 1.
+	if ks.localDataPacketID == 0 {
+		ks.localDataPacketID = 1
+	}
+
+	pid := ks.localDataPacketID
 	if pid == math.MaxUint32 {
 		// we reached the max packetID, increment will overflow
 		return 0, ErrExpiredKey
@@ -391,14 +521,35 @@ func (m *Manager) localDataPacketIDLocked() (model.PacketID, error) {
 	// Check for wrap trigger - matches OpenVPN's packet_id_close_to_wrapping()
 	// in packet_id.h:310-314. When packet ID reaches 0xFF000000, we should
 	// trigger renegotiation to ensure new keys are ready before ID exhaustion.
-	if pid >= packetIDWrapTrigger && !m.dataPacketIDWrapTriggered {
-		m.dataPacketIDWrapTriggered = true
+	if pid >= packetIDWrapTrigger && !ks.dataPacketIDWrapTriggered {
+		ks.dataPacketIDWrapTriggered = true
 		m.logger.Warnf("session: data packet ID %d (0x%X) reached wrap trigger, soft reset recommended",
 			pid, pid)
 	}
 
-	m.localDataPacketID++
+	ks.localDataPacketID++
 	return pid, nil
+}
+
+// dataKeyStateLocked returns the key state currently used for outbound
+// data-channel packets.
+//
+// During a soft reset / key rotation, OpenVPN keeps using the existing (lame duck)
+// data key until the new primary key reaches S_GENERATED_KEYS.
+//
+// The caller must hold m.mu.
+func (m *Manager) dataKeyStateLocked() *KeyState {
+	if primary := m.keySlots[KS_PRIMARY]; primary != nil && primary.State >= model.S_GENERATED_KEYS {
+		return primary
+	}
+	if lameDuck := m.keySlots[KS_LAME_DUCK]; lameDuck != nil && lameDuck.State >= model.S_GENERATED_KEYS {
+		return lameDuck
+	}
+	// Fallback for early/legacy callers; data channel shouldn't be active yet.
+	if primary := m.keySlots[KS_PRIMARY]; primary != nil {
+		return primary
+	}
+	return nil
 }
 
 // localControlPacketIDLocked returns an unique Packet ID for the Control Channel. It
@@ -419,7 +570,11 @@ func (m *Manager) localControlPacketIDLocked() (model.PacketID, error) {
 func (m *Manager) IsDataPacketIDNearWrap() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.dataPacketIDWrapTriggered
+	ks := m.dataKeyStateLocked()
+	if ks == nil {
+		return false
+	}
+	return ks.dataPacketIDWrapTriggered
 }
 
 // ResetDataPacketIDWrapFlag resets the wrap trigger flag after key rotation.
@@ -427,7 +582,12 @@ func (m *Manager) IsDataPacketIDNearWrap() bool {
 func (m *Manager) ResetDataPacketIDWrapFlag() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.dataPacketIDWrapTriggered = false
+	for _, ks := range m.keySlots {
+		if ks == nil {
+			continue
+		}
+		ks.dataPacketIDWrapTriggered = false
+	}
 }
 
 // NegotiationState returns the state of the negotiation.
@@ -450,6 +610,10 @@ func (m *Manager) SetNegotiationState(sns model.NegotiationState) {
 	// Handle must_negotiate deadline based on state transitions
 	// This matches OpenVPN's ssl.c behavior
 	if primary := m.keySlots[KS_PRIMARY]; primary != nil {
+		// Keep per-key state aligned with the current negotiation state.
+		// This matches OpenVPN's key_state.state transitions.
+		primary.State = sns
+
 		// Set must_negotiate when starting negotiation (entering S_PRE_START)
 		// This matches ssl.c:2719: ks->must_negotiate = now + session->opt->handshake_window
 		if oldState == model.S_INITIAL && sns == model.S_PRE_START {
@@ -460,15 +624,21 @@ func (m *Manager) SetNegotiationState(sns model.NegotiationState) {
 		}
 
 		// Clear must_negotiate when negotiation completes successfully
-		// This matches ssl.c:2793: ks->must_negotiate = 0
-		if sns == model.S_GENERATED_KEYS && oldState < model.S_GENERATED_KEYS {
+		// This matches ssl.c:2793: ks->must_negotiate = 0 when reaching S_ACTIVE.
+		if sns >= model.S_ACTIVE && oldState < model.S_ACTIVE {
 			primary.ClearNegotiationDeadline()
 			m.logger.Debugf("session: cleared must_negotiate deadline")
 		}
 	}
 
 	if sns == model.S_GENERATED_KEYS {
-		m.Ready <- true
+		// Ready is primarily used during initial tunnel bring-up (StartTUN).
+		// After the tunnel is established, we may reach S_GENERATED_KEYS again
+		// during key rotation; avoid blocking if nobody is listening.
+		select {
+		case m.Ready <- true:
+		default:
+		}
 	}
 }
 
@@ -495,6 +665,24 @@ func (m *Manager) SetRemoteSessionID(remoteSessionID model.SessionID) {
 func (m *Manager) CurrentKeyID() uint8 {
 	defer m.mu.RUnlock()
 	m.mu.RLock()
+	return m.keyID
+}
+
+// DataKeyID returns the key_id that should be used for data-channel packets.
+//
+// During a soft reset / key rotation, OpenVPN keeps using the existing (lame duck)
+// data key until the new primary key reaches S_GENERATED_KEYS.
+func (m *Manager) DataKeyID() uint8 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if primary := m.keySlots[KS_PRIMARY]; primary != nil && primary.State >= model.S_GENERATED_KEYS {
+		return primary.KeyID
+	}
+	if lameDuck := m.keySlots[KS_LAME_DUCK]; lameDuck != nil && lameDuck.State >= model.S_GENERATED_KEYS {
+		return lameDuck.KeyID
+	}
+	// Fallback for early/legacy callers before per-key state is established.
 	return m.keyID
 }
 
@@ -654,6 +842,71 @@ func (m *Manager) ResetControlReplay() {
 	m.controlReplayFilter.Reset()
 }
 
+// ResetForNewSession resets the session manager state for a new OpenVPN session.
+//
+// This is used when we need to "usurp" an existing session (e.g., when the
+// server restarts and sends a HARD_RESET with a new session-id).
+//
+// It clears the remote session ID, resets packet counters and replay state,
+// and replaces data-channel key material so a fresh key exchange can occur.
+func (m *Manager) ResetForNewSession() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Generate a new local session-id for the new session (OpenVPN behavior).
+	randomBytes, err := randomFn(8)
+	if err != nil {
+		return err
+	}
+	copy(m.localSessionID[:], randomBytes[:8])
+
+	// Clear the remote session-id so it can be set again when we receive the
+	// peer's HARD_RESET.
+	m.remoteSessionID = optional.None[model.SessionID]()
+
+	// Reset protocol/session negotiation state and inferred values.
+	m.negState = model.S_INITIAL
+	m.dataOpcode = 0
+	m.tunnelInfo = model.TunnelInfo{}
+
+	// Reset control-channel replay and counters.
+	if m.controlReplayFilter != nil {
+		m.controlReplayFilter.Reset()
+	}
+	m.localControlPacketID = 1
+	m.localControlReplayPacketID = 1
+	// Reset epoch timestamp for the new session.
+	m.controlReplayTimestamp = 0
+
+	m.controlEpoch++
+
+	// Reset key material and key state slots.
+	m.keyID = 0
+	newLocalKey, err := NewKeySource()
+	if err != nil {
+		return err
+	}
+	key0 := &DataChannelKey{}
+	_ = key0.AddLocalKey(newLocalKey)
+	m.keys = []*DataChannelKey{key0}
+	m.keySlots = [KS_SIZE]*KeyState{}
+	m.keySlots[KS_PRIMARY] = &KeyState{
+		Key:               key0,
+		KeyID:             0,
+		State:             model.S_INITIAL,
+		localDataPacketID: 1,
+	}
+
+	// Reset renegotiation counters and keepalive timers (new session begins).
+	m.keyEstablishedTime = time.Time{}
+	m.dataChannelBytesRead = 0
+	m.dataChannelBytesWritten = 0
+	m.renegotiationRequested = false
+	m.lastPacketTime = time.Time{}
+
+	return nil
+}
+
 // Very similar to the localControlPacketID, but includes ACKs as well
 func (m *Manager) localControlReplayPacketIDLocked() (model.PacketID, error) {
 	pid := m.localControlReplayPacketID
@@ -733,9 +986,14 @@ func (m *Manager) ShouldRenegotiate() bool {
 		}
 	}
 
-	// Check bytes-based renegotiation (only if > 0; -1 means disabled)
+	// Check bytes-based renegotiation (only if > 0; -1 means disabled).
+	// Uses per-key byte counters to match OpenVPN ssl.c:2671-2672:
+	// "ks->n_bytes >= session->opt->renegotiate_bytes"
 	if m.renegotiateBytes > 0 {
-		totalBytes := m.dataChannelBytesRead + m.dataChannelBytesWritten
+		var totalBytes int64
+		if primary := m.keySlots[KS_PRIMARY]; primary != nil {
+			totalBytes = primary.TotalBytes()
+		}
 		if totalBytes >= m.renegotiateBytes {
 			m.logger.Infof("session: renegotiation triggered by bytes (total=%d, limit=%d)",
 				totalBytes, m.renegotiateBytes)
@@ -754,6 +1012,13 @@ func (m *Manager) ShouldRenegotiate() bool {
 				totalPackets, m.renegotiatePackets)
 			shouldReneg = true
 		}
+	}
+
+	// Check for packet-id wrap trigger renegotiation. This matches OpenVPN's
+	// packet_id_close_to_wrapping() soft-reset behavior (ssl.c:2675).
+	if ks := m.dataKeyStateLocked(); ks != nil && ks.dataPacketIDWrapTriggered {
+		m.logger.Infof("session: renegotiation triggered by packet-id wrap threshold (key-id=%d)", ks.KeyID)
+		shouldReneg = true
 	}
 
 	if shouldReneg {
@@ -800,6 +1065,22 @@ func (m *Manager) UpdateLastPacketTime() {
 	m.lastPacketTime = time.Now()
 }
 
+// NotifyOutgoingPacket records a successful packet send to the network.
+// This mirrors OpenVPN's behavior of resetting the ping send timer on any
+// outgoing packet.
+func (m *Manager) NotifyOutgoingPacket() {
+	select {
+	case m.outgoingPacketActivity <- struct{}{}:
+	default:
+	}
+}
+
+// OutgoingPacketActivity returns a channel that is signaled when a packet is
+// successfully sent to the network.
+func (m *Manager) OutgoingPacketActivity() <-chan struct{} {
+	return m.outgoingPacketActivity
+}
+
 // LastPacketTime returns the time when the last packet was received.
 func (m *Manager) LastPacketTime() time.Time {
 	m.mu.RLock()
@@ -807,8 +1088,18 @@ func (m *Manager) LastPacketTime() time.Time {
 	return m.lastPacketTime
 }
 
+// SetPingOptions updates the ping/keepalive settings.
+// This is used to apply ping options received from the server via PUSH_REPLY.
+func (m *Manager) SetPingOptions(pingSeconds, pingRestartSeconds, pingExitSeconds int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pingSeconds = pingSeconds
+	m.pingRestartSeconds = pingRestartSeconds
+	m.pingExitSeconds = pingExitSeconds
+}
+
 // PingConfig returns the ping configuration.
-// Returns: pingInterval (0 = use default), timeoutSeconds, timeoutAction
+// Returns: pingInterval (0 = disabled), timeoutSeconds, timeoutAction
 func (m *Manager) PingConfig() (interval int, timeout int, action int) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -908,12 +1199,33 @@ func (m *Manager) KeySoftReset() error {
 
 	// Preserve remote session ID from the old key
 	newKey := &KeyState{
-		Key:             newDCK,
-		KeyID:           m.keyID,
-		State:           model.S_INITIAL,
-		RemoteSessionID: primary.RemoteSessionID,
+		Key:               newDCK,
+		KeyID:             m.keyID,
+		State:             model.S_INITIAL,
+		RemoteSessionID:   primary.RemoteSessionID,
+		localDataPacketID: 1,
+	}
+	// Set must_negotiate for the new key state (key_state_init behavior).
+	// This matches OpenVPN's ks->must_negotiate = now + handshake_window (ssl.c:2719).
+	if m.handshakeWindow > 0 {
+		newKey.SetNegotiationDeadline(m.handshakeWindow)
 	}
 	m.keySlots[KS_PRIMARY] = newKey
+
+	// Reset control-channel sequencing state, matching OpenVPN's key_state_init()
+	// behavior where reliable_init() restarts packet_id and ACK/queue state.
+	m.controlEpoch++
+	m.localControlPacketID = 1
+	// Reset epoch timestamp for the new key epoch.
+	m.controlReplayTimestamp = 0
+	if m.controlChannelSecurity != nil && m.controlChannelSecurity.Mode != wire.ControlSecurityModeNone {
+		// Unlike the initial hard reset, SOFT_RESET renegotiation does not reserve
+		// replay_id=1 for a hard reset packet, so restart from 1.
+		m.localControlReplayPacketID = 1
+	}
+	if m.controlReplayFilter != nil {
+		m.controlReplayFilter.Reset()
+	}
 
 	// Also update the legacy keys slice for backward compatibility
 	if int(m.keyID) >= len(m.keys) {
@@ -923,10 +1235,6 @@ func (m *Manager) KeySoftReset() error {
 		}
 	}
 	m.keys[m.keyID] = newDCK
-
-	// Reset the wrap trigger flag since we have a new key with fresh packet ID counter.
-	// The new key's data channel will start from packet ID 1 again.
-	m.dataPacketIDWrapTriggered = false
 
 	m.logger.Infof("session: new primary key %d created", m.keyID)
 	return nil
@@ -1098,7 +1406,7 @@ func (m *Manager) NegotiationTimeRemaining() time.Duration {
 	}
 
 	// Already completed negotiation
-	if primary.State >= model.S_GENERATED_KEYS {
+	if primary.State >= model.S_ACTIVE {
 		return 0
 	}
 

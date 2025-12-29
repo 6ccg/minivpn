@@ -1,8 +1,6 @@
 package config
 
 import (
-	"os"
-	fp "path/filepath"
 	"testing"
 
 	"github.com/google/go-cmp/cmp"
@@ -34,9 +32,8 @@ func TestNewConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("WithConfigFile sets OpenVPNOptions after parsing the configured file", func(t *testing.T) {
-		configFile := writeValidConfigFile(t.TempDir())
-		c := NewConfig(WithConfigFile(configFile))
+	t.Run("WithConfigBytes sets OpenVPNOptions after parsing the configured bytes", func(t *testing.T) {
+		c := NewConfig(WithConfigBytes([]byte(sampleConfigFile)))
 		opts := c.OpenVPNOptions()
 		if opts.Proto.String() != "udp" {
 			t.Error("expected proto udp")
@@ -68,9 +65,3 @@ dummy
 dummy
 </key>
 `
-
-func writeValidConfigFile(dir string) string {
-	cfg := fp.Join(dir, "config")
-	os.WriteFile(cfg, []byte(sampleConfigFile), 0600)
-	return cfg
-}

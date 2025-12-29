@@ -60,13 +60,20 @@ func (c *Config) Tracer() model.HandshakeTracer {
 	return c.tracer
 }
 
+// WithConfigBytes configures OpenVPNOptions parsed from the given .ovpn bytes.
+func WithConfigBytes(configBytes []byte) Option {
+	return func(config *Config) {
+		openvpnOpts, err := ReadConfigFromBytes(configBytes)
+		runtimex.PanicOnError(err, "cannot parse config")
+		runtimex.PanicIfFalse(openvpnOpts.HasAuthInfo(), "missing auth info")
+		config.openvpnOptions = openvpnOpts
+	}
+}
+
 // WithConfigFile configures OpenVPNOptions parsed from the given file.
 func WithConfigFile(configPath string) Option {
 	return func(config *Config) {
-		openvpnOpts, err := ReadConfigFile(configPath)
-		runtimex.PanicOnError(err, "cannot parse config file")
-		runtimex.PanicIfFalse(openvpnOpts.HasAuthInfo(), "missing auth info")
-		config.openvpnOptions = openvpnOpts
+		panic("WithConfigFile is disabled; read the .ovpn file in the caller and use WithConfigBytes/WithOpenVPNOptions instead")
 	}
 }
 

@@ -3,6 +3,7 @@ package datachannel
 import (
 	"bytes"
 	"crypto/hmac"
+	"encoding/binary"
 	"fmt"
 	"strings"
 
@@ -166,6 +167,16 @@ func (d *DataChannel) SetupKeysForSlot(dck *session.DataChannelKey, slot int, ke
 		return err
 	}
 
+	// When rotating keys, preserve the old primary key material as lame duck so
+	// that we can decrypt packets during transition_window (OpenVPN key_scan).
+	if slot == session.KS_PRIMARY {
+		prev := d.state.KeyMaterialAt(session.KS_PRIMARY)
+		if prev != nil && prev.Ready() && prev.KeyID() != keyID {
+			d.state.ClearSlot(session.KS_LAME_DUCK)
+			d.state.SetKeyMaterial(session.KS_LAME_DUCK, prev)
+		}
+	}
+
 	d.state.SetKeyMaterial(slot, km)
 
 	// Also update legacy fields for backward compatibility when setting primary key
@@ -286,6 +297,21 @@ func (d *DataChannel) readPacket(p *model.Packet) ([]byte, error) {
 		// Update counters on the correct key slot
 		d.sessionManager.AddKeyBytes(slotIdx, int64(len(p.Payload)), 0)
 		d.sessionManager.AddKeyPackets(slotIdx, 1, 0)
+
+		// Non-AEAD mode: decrypted payload contains packet_id and replay must be
+		// checked per-key (OpenVPN key_state behavior). The shared state replay
+		// window would break key rotation when packet_id restarts from 1.
+		if !d.state.dataCipher.isAEAD() {
+			if len(plaintext) < 4 {
+				return nil, fmt.Errorf("%w: payload too short for packet_id", ErrBadInput)
+			}
+			remotePacketID := model.PacketID(binary.BigEndian.Uint32(plaintext[:4]))
+			if err := km.CheckReplay(remotePacketID); err != nil {
+				return nil, err
+			}
+			return maybeDecompressNonAEADNoReplay(plaintext, d.options)
+		}
+
 		return maybeDecompress(plaintext, d.state, d.options)
 	}
 
@@ -340,9 +366,17 @@ func (d *DataChannel) decryptWithKeyMaterial(encrypted []byte, km *KeyMaterial) 
 
 // decodeEncryptedPayloadWithKeyMaterial decodes encrypted data using a specific KeyMaterial's HMAC.
 func (d *DataChannel) decodeEncryptedPayloadWithKeyMaterial(b []byte, km *KeyMaterial) (*encryptedData, error) {
-	// For now, delegate to the existing decoder which uses legacy state fields
-	// TODO: Full multi-key support would require passing KeyMaterial to decode functions
-	return d.decodeFn(d.log, b, d.sessionManager, d.state)
+	if d.state == nil || d.state.dataCipher == nil {
+		return &encryptedData{}, ErrInitError
+	}
+	if km == nil || !km.Ready() {
+		return &encryptedData{}, fmt.Errorf("%w: key material not ready", ErrBadInput)
+	}
+
+	if d.state.dataCipher.isAEAD() {
+		return decodeEncryptedPayloadAEADWithKeyMaterial(d.log, b, d.sessionManager, d.state, km)
+	}
+	return decodeEncryptedPayloadNonAEADWithKeyMaterial(d.log, b, d.sessionManager, d.state, km)
 }
 
 func (d *DataChannel) decrypt(encrypted []byte) ([]byte, error) {

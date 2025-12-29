@@ -30,9 +30,16 @@ func dataOpcode(session *session.Manager) model.Opcode {
 // encryptAndEncodePayloadAEAD peforms encryption and encoding of the payload in AEAD modes (i.e., AES-GCM).
 // Optimized to minimize allocations using scratch buffers.
 func encryptAndEncodePayloadAEAD(log model.Logger, padded []byte, session *session.Manager, state *dataChannelState) ([]byte, error) {
-	nextPacketID, err := session.LocalDataPacketID()
+	nextPacketID, keyID, err := session.LocalDataPacketIDAndKeyID()
 	if err != nil {
 		return nil, fmt.Errorf("bad packet id")
+	}
+
+	cipherKeyLocal := state.cipherKeyLocal
+	hmacKeyLocal := state.hmacKeyLocal
+	if km, _ := state.GetKeyMaterialByID(keyID); km != nil {
+		cipherKeyLocal = km.GetCipherKeyLocal()
+		hmacKeyLocal = km.GetHmacKeyLocal()
 	}
 
 	// Build AEAD header directly into scratch buffer (no allocation)
@@ -47,7 +54,7 @@ func encryptAndEncodePayloadAEAD(log model.Logger, padded []byte, session *sessi
 
 	aead := state.scratchAEADLocal[:aeadLen]
 	offset := 0
-	aead[offset] = opcodeAndKeyHeader(session)
+	aead[offset] = byte((byte(dataOpcode(session)) << 3) | (byte(keyID) & 0x07))
 	offset++
 	if dataOpcode(session) == model.P_DATA_V2 {
 		peerID := uint32(session.TunnelInfo().PeerID)
@@ -62,7 +69,7 @@ func encryptAndEncodePayloadAEAD(log model.Logger, padded []byte, session *sessi
 	// the iv is the packetID concatenated with 8 bytes of the hmac key
 	iv := state.scratchIVLocal[:]
 	binary.BigEndian.PutUint32(iv[:4], uint32(nextPacketID))
-	copy(iv[4:], state.hmacKeyLocal[:8])
+	copy(iv[4:], hmacKeyLocal[:8])
 
 	data := &plaintextData{
 		iv:        iv,
@@ -71,7 +78,7 @@ func encryptAndEncodePayloadAEAD(log model.Logger, padded []byte, session *sessi
 	}
 
 	encryptFn := state.dataCipher.encrypt
-	encrypted, err := encryptFn(state.cipherKeyLocal[:], data)
+	encrypted, err := encryptFn(cipherKeyLocal[:], data)
 	if err != nil {
 		return nil, err
 	}
@@ -111,16 +118,30 @@ func encryptAndEncodePayloadNonAEAD(log model.Logger, padded []byte, session *se
 		aead:      nil,
 	}
 
+	keyID := uint8(0)
+	if session != nil {
+		keyID = session.DataKeyID()
+	}
+
+	cipherKeyLocal := state.cipherKeyLocal
+	hmacLocal := state.hmacLocal
+	if km, _ := state.GetKeyMaterialByID(keyID); km != nil {
+		cipherKeyLocal = km.GetCipherKeyLocal()
+		if kmHMAC := km.HmacLocal(); kmHMAC != nil {
+			hmacLocal = kmHMAC
+		}
+	}
+
 	encryptFn := state.dataCipher.encrypt
-	ciphertext, err := encryptFn(state.cipherKeyLocal[:], data)
+	ciphertext, err := encryptFn(cipherKeyLocal[:], data)
 	if err != nil {
 		return nil, err
 	}
 
-	state.hmacLocal.Reset()
-	state.hmacLocal.Write(iv)
-	state.hmacLocal.Write(ciphertext)
-	computedMAC := state.hmacLocal.Sum(nil)
+	hmacLocal.Reset()
+	hmacLocal.Write(iv)
+	hmacLocal.Write(ciphertext)
+	computedMAC := hmacLocal.Sum(nil)
 
 	// Calculate header size
 	headerSize := 1 // opcode/key
@@ -134,7 +155,7 @@ func encryptAndEncodePayloadNonAEAD(log model.Logger, padded []byte, session *se
 
 	// Write directly to result buffer
 	offset := 0
-	result[offset] = opcodeAndKeyHeader(session)
+	result[offset] = byte((byte(dataOpcode(session)) << 3) | (byte(keyID) & 0x07))
 	offset++
 	if dataOpcode(session) == model.P_DATA_V2 {
 		peerID := uint32(session.TunnelInfo().PeerID)
@@ -211,5 +232,9 @@ func prependPacketID(p model.PacketID, buf []byte) []byte {
 // opcodeAndKeyHeader returns the header byte encoding the opcode and keyID (3 upper
 // and 5 lower bits, respectively)
 func opcodeAndKeyHeader(session *session.Manager) byte {
-	return byte((byte(dataOpcode(session)) << 3) | (byte(session.CurrentKeyID()) & 0x07))
+	var keyID uint8
+	if session != nil {
+		keyID = session.DataKeyID()
+	}
+	return byte((byte(dataOpcode(session)) << 3) | (byte(keyID) & 0x07))
 }

@@ -7,12 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
-
-	"github.com/ooni/minivpn/internal/runtimex"
 )
 
 type (
@@ -21,13 +18,21 @@ type (
 )
 
 const (
+	// CompressionUndef means compression is not configured (equivalent to OpenVPN's COMP_ALG_UNDEF).
+	// When undefined, no compression-related bytes are added to the OCC options string.
+	CompressionUndef = Compression("")
+
 	// CompressionStub adds the (empty) compression stub to the packets.
+	// This uses NO_COMPRESS_BYTE_SWAP (0xFB) with head/tail swap (COMP_F_SWAP).
 	CompressionStub = Compression("stub")
 
-	// CompressionEmpty is the empty compression.
+	// CompressionEmpty is explicitly "compress" with no argument - equivalent to stub+swap.
+	// NOTE: In OpenVPN 2.5, "compress" (no args) = COMP_ALG_STUB + COMP_F_SWAP,
+	// which is functionally identical to "compress stub". We treat them the same.
 	CompressionEmpty = Compression("empty")
 
 	// CompressionLZONo is lzo-no (another type of no-compression, older).
+	// This uses NO_COMPRESS_BYTE (0xFA) without swap.
 	CompressionLZONo = Compression("lzo-no")
 )
 
@@ -96,15 +101,22 @@ const (
 
 	// DefaultTransitionWindow is how long (seconds) a lame duck key stays alive
 	// after a soft reset. This corresponds to OpenVPN's --transition-window option.
-	DefaultTransitionWindow = 60
+	DefaultTransitionWindow = 3600
 
-	// DefaultHandshakeWindow is the default time in seconds within which the TLS handshake
-	// must complete (including PUSH_REPLY). Corresponds to OpenVPN's --hand-window option.
+	// DefaultHandshakeWindow is the default time in seconds within which TLS key negotiation
+	// must complete. Corresponds to OpenVPN's --hand-window option.
+	//
+	// OpenVPN also bounds PUSH_REQUEST retries using handshake_window / PUSH_REQUEST_INTERVAL.
 	DefaultHandshakeWindow = 60
 
 	// PushRequestInterval is the interval in seconds between PUSH_REQUEST retries.
 	// This matches OpenVPN's PUSH_REQUEST_INTERVAL constant in common.h.
 	PushRequestInterval = 5
+
+	// PrePullInitialPingRestart is the default --ping-restart timeout (in seconds)
+	// used in UDP pull mode before options are imported from PUSH_REPLY.
+	// This matches OpenVPN 2.5 PRE_PULL_INITIAL_PING_RESTART (ping.h).
+	PrePullInitialPingRestart = 120
 )
 
 // VerifyX509Type specifies how to verify the server certificate's X.509 name.
@@ -127,39 +139,87 @@ const (
 
 // KeyUsage represents X.509 Key Usage flags.
 // These correspond to the bits in the Key Usage extension (RFC 5280).
+//
+// IMPORTANT: Go's crypto/x509.KeyUsage uses "low-bit" ordering where
+// digitalSignature = 0x01, while OpenVPN uses "high-bit" ordering where
+// digitalSignature = 0x80. The constants below match Go's format.
+// When parsing --remote-cert-ku values (which use OpenVPN format),
+// use OpenVPNKeyUsageToGo() to convert.
 type KeyUsage uint16
 
 const (
-	// Key Usage bit flags (matching OpenVPN's definitions from ssl_verify.h)
-	KeyUsageDigitalSignature KeyUsage = 1 << 0 // 0x0001
-	KeyUsageNonRepudiation   KeyUsage = 1 << 1 // 0x0002
-	KeyUsageKeyEncipherment  KeyUsage = 1 << 2 // 0x0004
-	KeyUsageDataEncipherment KeyUsage = 1 << 3 // 0x0008
-	KeyUsageKeyAgreement     KeyUsage = 1 << 4 // 0x0010
-	KeyUsageKeyCertSign      KeyUsage = 1 << 5 // 0x0020
-	KeyUsageCRLSign          KeyUsage = 1 << 6 // 0x0040
-	KeyUsageEncipherOnly     KeyUsage = 1 << 7 // 0x0080
+	// Key Usage bit flags (matching Go crypto/x509.KeyUsage format)
+	// Note: OpenVPN config files use reversed bit order (see OpenVPNKeyUsageToGo)
+	KeyUsageDigitalSignature KeyUsage = 1 << 0 // 0x0001 (OpenVPN: 0x80)
+	KeyUsageNonRepudiation   KeyUsage = 1 << 1 // 0x0002 (OpenVPN: 0x40)
+	KeyUsageKeyEncipherment  KeyUsage = 1 << 2 // 0x0004 (OpenVPN: 0x20)
+	KeyUsageDataEncipherment KeyUsage = 1 << 3 // 0x0008 (OpenVPN: 0x10)
+	KeyUsageKeyAgreement     KeyUsage = 1 << 4 // 0x0010 (OpenVPN: 0x08)
+	KeyUsageKeyCertSign      KeyUsage = 1 << 5 // 0x0020 (OpenVPN: 0x04)
+	KeyUsageCRLSign          KeyUsage = 1 << 6 // 0x0040 (OpenVPN: 0x02)
+	KeyUsageEncipherOnly     KeyUsage = 1 << 7 // 0x0080 (OpenVPN: 0x01)
 	KeyUsageDecipherOnly     KeyUsage = 1 << 8 // 0x0100
+
+	// KeyUsageRequired matches OpenVPN's OPENVPN_KU_REQUIRED (0xFFFF).
+	//
+	// When this value appears as the first element of RemoteCertKU, it means
+	// the peer certificate MUST include the Key Usage extension, but its
+	// specific bits are not checked (OpenVPN 2.5 --remote-cert-ku with no
+	// args, and --remote-cert-tls).
+	KeyUsageRequired KeyUsage = 0xFFFF
 )
+
+// OpenVPNKeyUsageToGo converts OpenVPN's "high-bit" Key Usage format to
+// Go's "low-bit" format used by crypto/x509.KeyUsage.
+//
+// OpenVPN format (from ssl_verify_openssl.c):
+//
+//	digitalSignature = 0x80, nonRepudiation = 0x40, keyEncipherment = 0x20, etc.
+//
+// Go format (crypto/x509.KeyUsage):
+//
+//	digitalSignature = 0x01, nonRepudiation = 0x02, keyEncipherment = 0x04, etc.
+//
+// The conversion reverses the bit order for the first 8 bits.
+func OpenVPNKeyUsageToGo(ovpnKU uint16) KeyUsage {
+	var goKU uint16
+	// Convert the first 8 bits (standard Key Usage bits)
+	for i := 0; i < 8; i++ {
+		if ovpnKU&(1<<(7-i)) != 0 {
+			goKU |= 1 << i
+		}
+	}
+	// Bit 8 (decipherOnly) stays in the same position
+	// In OpenVPN, after the "fixup" in ssl_verify_openssl.c:676-679,
+	// decipherOnly would be in bit 0 of the second byte, but this is
+	// rarely used. For completeness, we handle it:
+	if ovpnKU&0x0100 != 0 {
+		goKU |= 0x0100
+	}
+	return KeyUsage(goKU)
+}
 
 // OpenVPNOptions make all the relevant openvpn configuration options accessible to the
 // different modules that need it.
 type OpenVPNOptions struct {
 	// These options have the same name of OpenVPN options referenced in the official documentation:
-	Remote     string
-	Port       string
-	Proto      Proto
-	Username   string
-	Password   string
-	CA         []byte
-	Cert       []byte
-	Key        []byte
-	TLSAuth    []byte
-	TLSCrypt   []byte
-	TLSCryptV2 []byte
-	Cipher     string
-	Auth       string
-	TLSMaxVer  string
+	Remote                     string
+	Port                       string
+	Proto                      Proto
+	Username                   string
+	Password                   string
+	authUserPassSourceUsername string
+	authUserPassSourcePassword string
+	ignoreUnknownOptions       map[string]struct{}
+	CA                         []byte
+	Cert                       []byte
+	Key                        []byte
+	TLSAuth                    []byte
+	TLSCrypt                   []byte
+	TLSCryptV2                 []byte
+	Cipher                     string
+	Auth                       string
+	TLSMaxVer                  string
 
 	// Below are options that do not conform strictly to the OpenVPN configuration format, but still can
 	// be understood by us in a configuration file:
@@ -197,17 +257,17 @@ type OpenVPNOptions struct {
 	RenegotiatePackets int64
 
 	// TransitionWindow is how long in seconds a lame duck key stays alive after soft reset.
-	// Default is 60 seconds. Corresponds to OpenVPN's --transition-window option.
+	// Default is 3600 seconds. Corresponds to OpenVPN's --transition-window option.
 	TransitionWindow int
 
 	// Ping is the interval in seconds for sending keepalive ping packets.
-	// Default is 0 (disabled, uses hardcoded 10s). When set, sends ping every N seconds.
+	// Default is 0 (disabled). When set, sends ping every N seconds.
 	// Corresponds to OpenVPN's --ping option.
 	Ping int
 
 	// PingRestart is the timeout in seconds after which the tunnel is restarted
 	// if no packets are received. Default is 0 (disabled).
-	// When triggered, sends SOFT_RESET to renegotiate keys.
+	// When triggered, the current tunnel is shut down so the caller can reconnect.
 	// Corresponds to OpenVPN's --ping-restart option.
 	PingRestart int
 
@@ -217,9 +277,9 @@ type OpenVPNOptions struct {
 	// Corresponds to OpenVPN's --ping-exit option.
 	PingExit int
 
-	// HandshakeWindow is the time in seconds within which the TLS handshake
-	// (including receiving PUSH_REPLY) must complete. Default is 60.
-	// Also controls the maximum number of PUSH_REQUEST retries.
+	// HandshakeWindow is the time in seconds within which TLS key negotiation
+	// must complete. Default is 60.
+	// Also bounds the maximum number of PUSH_REQUEST retries.
 	// Corresponds to OpenVPN's --hand-window option.
 	HandshakeWindow int
 
@@ -243,16 +303,38 @@ type OpenVPNOptions struct {
 	RemoteCertEKU string
 }
 
-// ReadConfigFile expects a string with a path to a valid config file,
-// and returns a pointer to a Options struct after parsing the file, and an
-// error if the operation could not be completed.
-func ReadConfigFile(filePath string) (*OpenVPNOptions, error) {
-	lines, err := getLinesFromFile(filePath)
-	dir, _ := filepath.Split(filePath)
+// ReadConfigFromReader parses an OpenVPN config from the given reader.
+//
+// This implementation is intentionally file-system agnostic: callers are
+// responsible for reading the .ovpn contents. This matches mihomo's security
+// model where only the mihomo layer may read the config file.
+func ReadConfigFromReader(r io.Reader) (*OpenVPNOptions, error) {
+	lines, err := getLinesFromReader(r)
 	if err != nil {
 		return nil, err
 	}
-	return getOptionsFromLines(lines, dir)
+	return getOptionsFromLines(lines, "")
+}
+
+// ReadConfigFromBytes parses an OpenVPN config from the given bytes.
+func ReadConfigFromBytes(configBytes []byte) (*OpenVPNOptions, error) {
+	return ReadConfigFromReader(bytes.NewReader(configBytes))
+}
+
+// ReadConfigFromString parses an OpenVPN config from the given string.
+func ReadConfigFromString(configString string) (*OpenVPNOptions, error) {
+	return ReadConfigFromBytes([]byte(configString))
+}
+
+// ReadConfigFile is intentionally disabled: reading configuration files from
+// disk is forbidden in this codebase. Callers must read the .ovpn file and pass
+// its contents to [ReadConfigFromBytes] or [ReadConfigFromReader].
+func ReadConfigFile(filePath string) (*OpenVPNOptions, error) {
+	return nil, fmt.Errorf(
+		"%w: %s",
+		ErrBadConfig,
+		"config file paths are not supported; read the .ovpn file and use ReadConfigFromBytes",
+	)
 }
 
 // HasAuthInfo returns true if:
@@ -275,39 +357,67 @@ func (o *OpenVPNOptions) HasAuthInfo() bool {
 	return false
 }
 
-// clientOptions is the options line we're passing to the OpenVPN server during the handshake.
-const clientOptions = "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto %s,cipher %s,auth %s,keysize %s,key-method 2,tls-client"
+const (
+	// OpenVPN 2.5: for backward compatibility, options string uses "UDPv4" and
+	// "TCPv4_CLIENT"/"TCPv4_SERVER" even for IPv6 connections (socket.c:proto_remote).
+	optionsStringUDPClient = "UDPv4"
+	optionsStringTCPClient = "TCPv4_CLIENT"
+)
+
+func cipherKeySizeBits(cipher string) (int, bool) {
+	parts := strings.Split(cipher, "-")
+	if len(parts) < 2 {
+		return 0, false
+	}
+	bits, err := strconv.Atoi(parts[1])
+	if err != nil || bits <= 0 {
+		return 0, false
+	}
+	return bits, true
+}
 
 // ServerOptionsString produces a comma-separated representation of the options, in the same
 // order and format that the OpenVPN server expects from us.
 func (o *OpenVPNOptions) ServerOptionsString() string {
-	if o.Cipher == "" {
-		return ""
+	// OpenVPN default auth is SHA1 (options.c:865).
+	auth := o.Auth
+	if auth == "" {
+		auth = "SHA1"
 	}
-	// TODO(ainghazal): this line of code crashes if the ciphers are not well formed
-	keysize := strings.Split(o.Cipher, "-")[1]
-	proto := "UDPv4"
-	switch o.Proto {
-	case ProtoTCP, ProtoTCP4:
-		proto = "TCPv4"
-	case ProtoTCP6:
-		proto = "TCPv6"
-	case ProtoUDP, ProtoUDP4:
-		proto = "UDPv4"
-	case ProtoUDP6:
-		proto = "UDPv6"
-	default:
-		proto = strings.ToUpper(o.Proto.String())
+
+	proto := optionsStringUDPClient
+	if o.Proto.IsTCP() {
+		proto = optionsStringTCPClient
 	}
-	s := fmt.Sprintf(clientOptions, proto, o.Cipher, o.Auth, keysize)
-	if o.Compress == CompressionStub {
-		s = s + ",compress stub"
-	} else if o.Compress == "lzo-no" {
-		s = s + ",lzo-comp no"
-	} else if o.Compress == CompressionEmpty {
-		s = s + ",compress"
+
+	// OpenVPN 2.5: when cipher is not set, options_string uses BF-CBC as an internal
+	// default but does not announce it in NCP mode; keysize defaults to 128 (options.c:3886).
+	keysizeBits := 128
+	includeCipher := o.Cipher != ""
+	if includeCipher {
+		bits, ok := cipherKeySizeBits(o.Cipher)
+		if !ok {
+			return ""
+		}
+		keysizeBits = bits
 	}
-	return s
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "V4,dev-type tun,link-mtu 1601,tun-mtu 1500,proto %s", proto)
+	if includeCipher {
+		fmt.Fprintf(&b, ",cipher %s", o.Cipher)
+	}
+	fmt.Fprintf(&b, ",auth %s,keysize %d,key-method 2,tls-client", auth, keysizeBits)
+
+	// OpenVPN 2.5: options_string uses ",comp-lzo" when compression context is active
+	// (alg != COMP_ALG_UNDEF), regardless of the specific algorithm. This is for
+	// backward compatibility - see options.c:3838-3841 comment:
+	// "for compatibility, this simply indicates that compression context is active,
+	// not necessarily LZO per-se"
+	if o.Compress != CompressionUndef {
+		b.WriteString(",comp-lzo")
+	}
+	return b.String()
 }
 
 func parseProto(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
@@ -476,7 +586,10 @@ func parseCompress(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
 		return o, fmt.Errorf("%w: %s", ErrBadConfig, "compress: only empty/stub options supported")
 	}
 	if len(p) == 0 {
-		o.Compress = CompressionEmpty
+		// OpenVPN 2.5: "compress" with no argument = COMP_ALG_STUB + COMP_F_SWAP
+		// This uses NO_COMPRESS_BYTE_SWAP (0xFB) with head/tail byte swap.
+		// See options.c:7916-7920 and compstub.c:59-69
+		o.Compress = CompressionStub
 		return o, nil
 	}
 	if p[0] == "stub" {
@@ -494,18 +607,21 @@ func parseCompLZO(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
 	return o, nil
 }
 
-// parseTLSVerMax sets the maximum TLS version. This is currently ignored
-// because we're using uTLS to parrot the Client Hello.
+// parseTLSVerMax sets the maximum TLS version for the control channel TLS handshake.
+//
+// OpenVPN accepts values like "1.2" and "1.3". We only support up to OpenVPN 2.5,
+// hence we currently only accept "1.2" and "1.3".
 func parseTLSVerMax(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
-	if len(p) == 0 {
-		o.TLSMaxVer = "1.3"
+	if len(p) != 1 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "tls-version-max expects one arg")
+	}
+	switch p[0] {
+	case "1.2", "1.3":
+		o.TLSMaxVer = p[0]
 		return o, nil
+	default:
+		return o, fmt.Errorf("%w: unknown tls-version-max parameter: %s", ErrBadConfig, p[0])
 	}
-	log.Printf("warn: tls-version-max %s is ignored (uTLS manages TLS version)", p[0])
-	if p[0] == "1.2" {
-		o.TLSMaxVer = "1.2"
-	}
-	return o, nil
 }
 
 func parseProxyOBFS4(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
@@ -689,21 +805,41 @@ func parseVerifyX509Name(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error)
 
 // parseRemoteCertKU parses the --remote-cert-ku option.
 // Syntax: remote-cert-ku ku1 [ku2 ...]
-// Each ku is a hexadecimal Key Usage value (e.g., 80, a0, 88).
+// Each ku is a hexadecimal Key Usage value in OpenVPN format (e.g., 80, a0, 88).
+// OpenVPN uses "high-bit" format where digitalSignature=0x80, keyEncipherment=0x20, etc.
+// The values are converted to Go's "low-bit" format for comparison with x509.KeyUsage.
 // The certificate must match at least one of the specified values.
 func parseRemoteCertKU(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
 	if len(p) == 0 {
-		return o, fmt.Errorf("%w: %s", ErrBadConfig, "remote-cert-ku expects at least one arg")
+		// OpenVPN 2.5 semantics: no args means "require the KU extension
+		// to be present", but do not require any specific KU bits.
+		o.RemoteCertKU = []KeyUsage{KeyUsageRequired}
+		return o, nil
 	}
 
-	for _, kuStr := range p {
-		// Parse hexadecimal value (OpenVPN uses hex format)
+	remoteCertKU := make([]KeyUsage, 0, len(p))
+	for idx, kuStr := range p {
+		// Parse hexadecimal value (OpenVPN uses hex format with high-bit ordering)
 		kuVal, err := strconv.ParseUint(kuStr, 16, 16)
 		if err != nil {
 			return o, fmt.Errorf("%w: remote-cert-ku: invalid hex value: %s", ErrBadConfig, kuStr)
 		}
-		o.RemoteCertKU = append(o.RemoteCertKU, KeyUsage(kuVal))
+		ku := uint16(kuVal)
+		// Preserve OpenVPN's OPENVPN_KU_REQUIRED sentinel (0xFFFF).
+		// If it is the first element, it activates "KU extension required".
+		if ku == uint16(KeyUsageRequired) && idx == 0 {
+			o.RemoteCertKU = []KeyUsage{KeyUsageRequired}
+			return o, nil
+		}
+		if ku == uint16(KeyUsageRequired) {
+			remoteCertKU = append(remoteCertKU, KeyUsageRequired)
+			continue
+		}
+
+		// Convert from OpenVPN's high-bit format to Go's low-bit format.
+		remoteCertKU = append(remoteCertKU, OpenVPNKeyUsageToGo(ku))
 	}
+	o.RemoteCertKU = remoteCertKU
 	return o, nil
 }
 
@@ -730,11 +866,13 @@ func parseRemoteCertTLS(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) 
 	}
 	switch strings.ToLower(p[0]) {
 	case "server":
-		// TLS Web Server Authentication (OID 1.3.6.1.5.5.7.3.1)
-		o.RemoteCertEKU = "serverAuth"
+		// OpenVPN 2.5: also requires the KU extension to be present.
+		o.RemoteCertKU = []KeyUsage{KeyUsageRequired}
+		o.RemoteCertEKU = "TLS Web Server Authentication"
 	case "client":
-		// TLS Web Client Authentication (OID 1.3.6.1.5.5.7.3.2)
-		o.RemoteCertEKU = "clientAuth"
+		// OpenVPN 2.5: also requires the KU extension to be present.
+		o.RemoteCertKU = []KeyUsage{KeyUsageRequired}
+		o.RemoteCertEKU = "TLS Web Client Authentication"
 	default:
 		return o, fmt.Errorf("%w: remote-cert-tls: must be 'server' or 'client', got: %s", ErrBadConfig, p[0])
 	}
@@ -742,35 +880,58 @@ func parseRemoteCertTLS(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) 
 }
 
 func parseAuthNoCache(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) != 0 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "auth-nocache expects no args")
+	}
 	o.AuthNoCache = true
 	return o, nil
 }
 
+func parseIgnoreUnknownOption(p []string, o *OpenVPNOptions) (*OpenVPNOptions, error) {
+	if len(p) == 0 {
+		return o, fmt.Errorf("%w: %s", ErrBadConfig, "ignore-unknown-option expects at least one arg")
+	}
+	if o.ignoreUnknownOptions == nil {
+		o.ignoreUnknownOptions = make(map[string]struct{})
+	}
+	for _, token := range p {
+		for _, option := range strings.Split(token, ",") {
+			option = strings.TrimSpace(option)
+			if option == "" {
+				continue
+			}
+			o.ignoreUnknownOptions[option] = struct{}{}
+		}
+	}
+	return o, nil
+}
+
 var pMap = map[string]interface{}{
-	"proto":             parseProto,
-	"remote":            parseRemote,
-	"cipher":            parseCipher,
-	"auth":              parseAuth,
-	"key-direction":     parseKeyDirection,
-	"compress":          parseCompress,
-	"comp-lzo":          parseCompLZO,
-	"proxy-obfs4":       parseProxyOBFS4,
-	"tls-version-max":   parseTLSVerMax, // this is currently ignored because of uTLS
-	"fragment":          parseFragment,
-	"reneg-sec":         parseRenegSec,
-	"reneg-bytes":       parseRenegBytes,
-	"reneg-pkts":        parseRenegPkts,
-	"transition-window": parseTransitionWindow,
-	"ping":              parsePing,
-	"ping-restart":      parsePingRestart,
-	"ping-exit":         parsePingExit,
-	"keepalive":         parseKeepalive,
-	"hand-window":       parseHandWindow,
-	"verify-x509-name":  parseVerifyX509Name,
-	"auth-nocache":      parseAuthNoCache,
-	"remote-cert-ku":    parseRemoteCertKU,
-	"remote-cert-eku":   parseRemoteCertEKU,
-	"remote-cert-tls":   parseRemoteCertTLS,
+	"proto":                 parseProto,
+	"remote":                parseRemote,
+	"cipher":                parseCipher,
+	"auth":                  parseAuth,
+	"key-direction":         parseKeyDirection,
+	"compress":              parseCompress,
+	"comp-lzo":              parseCompLZO,
+	"proxy-obfs4":           parseProxyOBFS4,
+	"tls-version-max":       parseTLSVerMax,
+	"fragment":              parseFragment,
+	"reneg-sec":             parseRenegSec,
+	"reneg-bytes":           parseRenegBytes,
+	"reneg-pkts":            parseRenegPkts,
+	"transition-window":     parseTransitionWindow,
+	"ping":                  parsePing,
+	"ping-restart":          parsePingRestart,
+	"ping-exit":             parsePingExit,
+	"keepalive":             parseKeepalive,
+	"hand-window":           parseHandWindow,
+	"verify-x509-name":      parseVerifyX509Name,
+	"ignore-unknown-option": parseIgnoreUnknownOption,
+	"auth-nocache":          parseAuthNoCache,
+	"remote-cert-ku":        parseRemoteCertKU,
+	"remote-cert-eku":       parseRemoteCertEKU,
+	"remote-cert-tls":       parseRemoteCertTLS,
 }
 
 var pMapDir = map[string]interface{}{
@@ -785,7 +946,7 @@ var pMapDir = map[string]interface{}{
 
 func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (*OpenVPNOptions, error) {
 	switch key {
-	case "proto", "remote", "cipher", "auth", "key-direction", "compress", "comp-lzo", "tls-version-max", "proxy-obfs4", "fragment", "reneg-sec", "reneg-bytes", "reneg-pkts", "transition-window", "ping", "ping-restart", "ping-exit", "keepalive", "hand-window", "verify-x509-name", "auth-nocache", "remote-cert-ku", "remote-cert-eku", "remote-cert-tls":
+	case "proto", "remote", "cipher", "auth", "key-direction", "compress", "comp-lzo", "tls-version-max", "proxy-obfs4", "fragment", "reneg-sec", "reneg-bytes", "reneg-pkts", "transition-window", "ping", "ping-restart", "ping-exit", "keepalive", "hand-window", "verify-x509-name", "ignore-unknown-option", "auth-nocache", "remote-cert-ku", "remote-cert-eku", "remote-cert-tls":
 		fn := pMap[key].(func([]string, *OpenVPNOptions) (*OpenVPNOptions, error))
 		if updatedOpt, e := fn(p, opt); e != nil {
 			return updatedOpt, e
@@ -795,8 +956,68 @@ func parseOption(opt *OpenVPNOptions, dir, key string, p []string, lineno int) (
 		if updatedOpt, e := fn(p, opt, dir); e != nil {
 			return updatedOpt, e
 		}
+	case "pkcs12":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			"pkcs12 file paths are not supported; use inline <ca>/<cert>/<key> blocks instead",
+		)
+	case "capath":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			"capath is not supported; embed <ca>...</ca> in the .ovpn file",
+		)
+	case "extra-certs":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			"extra-certs file paths are not supported",
+		)
+	case "crl-verify":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			"crl-verify file paths are not supported",
+		)
+	case "dh":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			"dh file paths are not supported",
+		)
+	case "secret":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			"secret file paths are not supported",
+		)
+	case "http-proxy-user-pass":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			"http-proxy-user-pass file paths are not supported",
+		)
+	case "tls-export-cert", "writepid", "status", "log", "log-append":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			key+" external paths are not supported",
+		)
+	case "up", "down", "route-up", "ipchange", "client-connect", "client-disconnect", "learn-address", "tls-verify", "auth-user-pass-verify", "plugin", "management", "config", "cd", "chroot":
+		return opt, fmt.Errorf(
+			"%w: %s",
+			ErrBadConfig,
+			key+" external paths are not supported",
+		)
 	default:
-		log.Printf("warn: unsupported key in line %d\n", lineno)
+		if opt != nil && opt.ignoreUnknownOptions != nil {
+			if _, ok := opt.ignoreUnknownOptions[key]; ok {
+				log.Printf("warn: ignoring unknown option %q in line %d\n", key, lineno+1)
+				return opt, nil
+			}
+		}
+		return opt, fmt.Errorf("%w: unsupported option %q in line %d", ErrBadConfig, key, lineno+1)
 	}
 	return opt, nil
 }
@@ -818,9 +1039,9 @@ func getOptionsFromLines(lines []string, dir string) (*OpenVPNOptions, error) {
 		TLSCrypt:           []byte{},
 		TLSCryptV2:         []byte{},
 		Cipher:             "",
-		Auth:               "",
+		Auth:               "SHA1",
 		TLSMaxVer:          "",
-		Compress:           CompressionEmpty,
+		Compress:           CompressionUndef, // OpenVPN default: COMP_ALG_UNDEF (no compression context)
 		ProxyOBFS4:         "",
 		RenegotiateSeconds: DefaultRenegotiateSeconds,
 		RenegotiateBytes:   DefaultRenegotiateBytes,
@@ -990,78 +1211,41 @@ func hasElement(el string, arr []string) bool {
 	return false
 }
 
-// existsFile returns true if the file to which the path refers to exists and
-// is a regular file.
-func existsFile(path string) bool {
-	statbuf, err := os.Stat(path)
-	return !errors.Is(err, os.ErrNotExist) && statbuf.Mode().IsRegular()
-}
-
-func mustClose(c io.Closer) {
-	err := c.Close()
-	runtimex.PanicOnError(err, "could not close")
-}
-
-// getLinesFromFile accepts a path parameter, and return a string array with
-// its content and an error if the operation cannot be completed.
-func getLinesFromFile(path string) ([]string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
+func getLinesFromReader(r io.Reader) ([]string, error) {
+	if r == nil {
+		return nil, fmt.Errorf("%w: %s", ErrBadConfig, "nil config reader")
 	}
-	defer mustClose(f)
-
 	lines := make([]string, 0)
-	scanner := bufio.NewScanner(f)
+	scanner := bufio.NewScanner(r)
 	for scanner.Scan() {
 		lines = append(lines, scanner.Text())
 	}
-	err = scanner.Err()
-	if err != nil {
+	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 	return lines, nil
 }
 
-// getCredentialsFromFile accepts a path string parameter, and return a string
-// array containing the credentials in that file, and an error if the operation
-// could not be completed.
+// getCredentialsFromFile is intentionally disabled: external credential files
+// are not supported. This function exists only to keep backward compatibility
+// with older tests and callers.
 func getCredentialsFromFile(path string) ([]string, error) {
-	lines, err := getLinesFromFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %s", ErrBadConfig, err)
-	}
-	if len(lines) != 2 {
-		return nil, fmt.Errorf("%w: %s", ErrBadConfig, "malformed credentials file")
-	}
-	if len(lines[0]) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrBadConfig, "empty username in creds file")
-	}
-	if len(lines[1]) == 0 {
-		return nil, fmt.Errorf("%w: %s", ErrBadConfig, "empty password in creds file")
-	}
-	return lines, nil
+	return nil, fmt.Errorf("%w: %s", ErrBadConfig, "credential file paths are not supported")
 }
 
-// toAbs return an absolute path if the given path is not already absolute; to
-// do so, it will append the path to the given basedir.
-func toAbs(path, basedir string) string {
-	if filepath.IsAbs(path) {
-		return path
-	}
-	return filepath.Join(basedir, path)
-}
-
-// isSubdir checks if a given path is a subdirectory of another. It returns
-// true if that's the case, and any error raise during the check.
+// isSubdir checks if `sub` is contained in `parent` (or equal). Both paths must
+// be absolute; otherwise this function returns (false, nil).
 func isSubdir(parent, sub string) (bool, error) {
-	p, err := filepath.Abs(parent)
-	if err != nil {
-		return false, err
+	if !strings.HasPrefix(parent, "/") || !strings.HasPrefix(sub, "/") {
+		return false, nil
 	}
-	s, err := filepath.Abs(sub)
-	if err != nil {
-		return false, err
+	parentClean := path.Clean(parent)
+	subClean := path.Clean(sub)
+	if parentClean == subClean {
+		return true, nil
 	}
-	return strings.HasPrefix(s, p), nil
+	if strings.HasPrefix(subClean, parentClean+"/") {
+		return true, nil
+	}
+	return false, nil
 }

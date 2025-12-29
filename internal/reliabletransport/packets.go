@@ -50,12 +50,7 @@ func (p *inFlightPacket) ScheduleForRetransmission(t time.Time) {
 
 // backoff will calculate the next retransmission interval.
 func (p *inFlightPacket) backoff() time.Duration {
-	backoff := time.Duration(1<<p.retries) * time.Second
-	maxBackoff := MAX_BACKOFF_SECONDS * time.Second
-	if backoff > maxBackoff {
-		backoff = maxBackoff
-	}
-	return backoff
+	return time.Duration(INITIAL_TLS_TIMEOUT_SECONDS) * time.Second
 }
 
 // inflightSequence is a sequence of inFlightPackets.
@@ -133,6 +128,7 @@ func (seq incomingSequence) Less(i, j int) bool {
 
 // incomingPacketSeen is a struct that the receiver sends us when a new packet is seen.
 type incomingPacketSeen struct {
-	id   optional.Value[model.PacketID]
-	acks optional.Value[[]model.PacketID]
+	keyID byte
+	id    optional.Value[model.PacketID]
+	acks  optional.Value[[]model.PacketID]
 }

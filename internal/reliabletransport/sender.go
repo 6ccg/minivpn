@@ -1,6 +1,7 @@
 package reliabletransport
 
 import (
+	"bytes"
 	"fmt"
 	"sort"
 	"time"
@@ -32,11 +33,32 @@ func (ws *workersState) moveDownWorker() {
 
 	sender := newReliableSender(ws.logger, ws.incomingSeen)
 	ticker := time.NewTicker(time.Duration(SENDER_TICKER_MS) * time.Millisecond)
+	lastRemoteSessionID := append([]byte(nil), ws.sessionManager.RemoteSessionID()...)
+	lastControlEpoch := ws.sessionManager.ControlEpoch()
+
+	// Reset per-session sender state when:
+	// - the remote session ID changes (HARD reset/new session), or
+	// - control-channel sequencing state is reset (SOFT reset / key rotation).
+	//
+	// In the official OpenVPN 2.5.x implementation, the reliable sender/receiver
+	// state lives inside key_state, so a soft reset rebuilds this state. We model
+	// this behavior by resetting the sender when ControlEpoch() changes.
+	maybeResetSender := func() {
+		currentRemoteSessionID := ws.sessionManager.RemoteSessionID()
+		currentControlEpoch := ws.sessionManager.ControlEpoch()
+		if !bytes.Equal(currentRemoteSessionID, lastRemoteSessionID) || currentControlEpoch != lastControlEpoch {
+			lastRemoteSessionID = append([]byte(nil), currentRemoteSessionID...)
+			lastControlEpoch = currentControlEpoch
+			sender.Reset()
+		}
+	}
 
 	for {
 		// POSSIBLY BLOCK reading the next packet we should move down the stack
 		select {
 		case packet := <-ws.controlToReliable:
+			maybeResetSender()
+
 			// try to insert and schedule for immediate wakeup
 			inserted := sender.TryInsertOutgoingPacket(packet)
 			ws.logger.Debugf(
@@ -54,6 +76,8 @@ func (ws *workersState) moveDownWorker() {
 			}
 
 		case seenPacket := <-sender.incomingSeen:
+			maybeResetSender()
+
 			// possibly evict any acked packet (in the ack array)
 			// and add any id to the queue of packets to ack
 			sender.OnIncomingPacketSeen(seenPacket)
@@ -62,6 +86,7 @@ func (ws *workersState) moveDownWorker() {
 			}
 
 		case <-ticker.C:
+			maybeResetSender()
 			ws.blockOnTryingToSend(sender, ticker)
 
 		case <-ws.workersManager.ShouldShutdown():
@@ -95,28 +120,37 @@ func (ws *workersState) blockOnTryingToSend(sender *reliableSender, ticker *time
 		for _, p := range scheduledNow {
 			p.ScheduleForRetransmission(now)
 
-			// append any pending ACKs
-			p.packet.ACKs = sender.NextPacketIDsToACK()
+			// Do not mutate the in-flight packet: the reliable layer keeps a stable
+			// cleartext packet, while each transmission regenerates ACKs and
+			// control-channel anti-replay fields (tls-auth/tls-crypt).
+			sendPacket := new(model.Packet)
+			*sendPacket = *p.packet
+			sendPacket.ACKs = sender.NextPacketIDsToACK()
+
+			// Keep RemoteSessionID up to date for ACK piggybacking.
+			if rs := ws.sessionManager.RemoteSessionID(); len(rs) == len(sendPacket.RemoteSessionID) {
+				copy(sendPacket.RemoteSessionID[:], rs)
+			}
 			ws.logger.Debugf(
 				"reliabletransport: sending opcode=%s id=%d replay=%d ts=%d acks=%v payload=%d",
-				p.packet.Opcode,
-				p.packet.ID,
-				p.packet.ReplayPacketID,
-				p.packet.Timestamp,
-				p.packet.ACKs,
-				len(p.packet.Payload),
+				sendPacket.Opcode,
+				sendPacket.ID,
+				sendPacket.ReplayPacketID,
+				sendPacket.Timestamp,
+				sendPacket.ACKs,
+				len(sendPacket.Payload),
 			)
 
 			// log and trace the packet
-			p.packet.Log(ws.logger, model.DirectionOutgoing)
+			sendPacket.Log(ws.logger, model.DirectionOutgoing)
 			ws.tracer.OnOutgoingPacket(
-				p.packet,
+				sendPacket,
 				ws.sessionManager.NegotiationState(),
 				p.retries,
 			)
 
 			select {
-			case ws.dataOrControlToMuxer <- p.packet:
+			case ws.dataOrControlToMuxer <- sendPacket:
 			case <-ws.workersManager.ShouldShutdown():
 				return
 			}
@@ -177,6 +211,21 @@ func newReliableSender(logger model.Logger, ch chan incomingPacketSeen) *reliabl
 		pendingACKsToSend: newACKSet(),
 		rtt:               newRTTTracker(),
 	}
+}
+
+// Reset clears all per-session sender state (in-flight packets, pending ACKs, RTT).
+// This is used when:
+// - the remote session ID changes (HARD reset/new session), or
+// - the control-channel sequencing epoch changes (SOFT reset / key rotation).
+func (r *reliableSender) Reset() {
+	for _, p := range r.inFlight {
+		if p != nil && p.packet != nil {
+			p.packet.Free()
+		}
+	}
+	r.inFlight = make([]*inFlightPacket, 0, RELIABLE_SEND_BUFFER_SIZE)
+	r.pendingACKsToSend = newACKSet()
+	r.rtt = newRTTTracker()
 }
 
 // implement outgoingPacketWriter

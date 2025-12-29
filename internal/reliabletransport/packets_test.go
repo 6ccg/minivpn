@@ -20,47 +20,47 @@ func Test_inFlightPacket_backoff(t *testing.T) {
 		{
 			name:   "retries=0",
 			fields: fields{0},
-			want:   time.Second,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 		{
 			name:   "retries=1",
 			fields: fields{1},
-			want:   time.Second * 2,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 		{
 			name:   "retries=2",
 			fields: fields{2},
-			want:   time.Second * 4,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 		{
 			name:   "retries=3",
 			fields: fields{3},
-			want:   time.Second * 8,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 		{
 			name:   "retries=4",
 			fields: fields{4},
-			want:   time.Second * 16,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 		{
 			name:   "retries=5",
 			fields: fields{5},
-			want:   time.Second * 32,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 		{
 			name:   "retries=6",
 			fields: fields{6},
-			want:   time.Second * 60,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 		{
 			name:   "retries=10",
 			fields: fields{10},
-			want:   time.Second * 60,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 		{
 			name:   "retries=6",
 			fields: fields{6},
-			want:   time.Second * 60,
+			want:   time.Second * INITIAL_TLS_TIMEOUT_SECONDS,
 		},
 	}
 	for _, tt := range tests {
@@ -80,31 +80,31 @@ func Test_inFlightPacket_ScheduleForRetransmission(t *testing.T) {
 	if p0.retries != 0 {
 		t.Errorf("inFlightPacket.retries should be 0")
 	}
-	t0 := time.Now()
+	t0 := time.Date(1984, time.January, 1, 0, 0, 0, 0, time.UTC)
 	p0.ScheduleForRetransmission(t0)
 	if p0.retries != 1 {
-		t.Errorf("inFlightPacket.retries should be 0")
+		t.Errorf("inFlightPacket.retries should be 1")
 	}
-	if p0.deadline != t0.Add(time.Second*2) {
-		t.Errorf("inFlightPacket.deadline should be 2s in the future")
+	if p0.deadline != t0.Add(time.Second*INITIAL_TLS_TIMEOUT_SECONDS) {
+		t.Errorf("inFlightPacket.deadline should be %ds in the future", INITIAL_TLS_TIMEOUT_SECONDS)
 	}
-	// schedule twice now
-	p0.ScheduleForRetransmission(t0)
-	p0.ScheduleForRetransmission(t0)
+
+	t1 := t0.Add(10 * time.Second)
+	p0.ScheduleForRetransmission(t1)
+	if p0.retries != 2 {
+		t.Errorf("inFlightPacket.retries should be 2")
+	}
+	if p0.deadline != t1.Add(time.Second*INITIAL_TLS_TIMEOUT_SECONDS) {
+		t.Errorf("inFlightPacket.deadline should be %ds in the future", INITIAL_TLS_TIMEOUT_SECONDS)
+	}
+
+	t2 := t1.Add(10 * time.Second)
+	p0.ScheduleForRetransmission(t2)
 	if p0.retries != 3 {
 		t.Errorf("inFlightPacket.retries should be 3")
 	}
-	if p0.deadline != t0.Add(time.Second*8) {
-		t.Errorf("inFlightPacket.deadline should be 8s in the future")
-	}
-	// schedule twice again
-	p0.ScheduleForRetransmission(t0)
-	p0.ScheduleForRetransmission(t0)
-	if p0.retries != 5 {
-		t.Errorf("inFlightPacket.retries should be 5")
-	}
-	if p0.deadline != t0.Add(time.Second*32) {
-		t.Errorf("inFlightPacket.deadline should be 32s in the future")
+	if p0.deadline != t2.Add(time.Second*INITIAL_TLS_TIMEOUT_SECONDS) {
+		t.Errorf("inFlightPacket.deadline should be %ds in the future", INITIAL_TLS_TIMEOUT_SECONDS)
 	}
 }
 

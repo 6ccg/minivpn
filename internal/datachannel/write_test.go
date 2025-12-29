@@ -2,6 +2,7 @@ package datachannel
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/hex"
 	"errors"
@@ -126,6 +127,146 @@ func Test_encryptAndEncodePayloadNonAEAD(t *testing.T) {
 	}
 }
 
+func Test_encryptAndEncodePayloadAEAD_MultiKeyUsesKeyMaterialMatchingDataKeyID(t *testing.T) {
+	sm := makeTestingSession()
+	sm.MarkPrimaryKeyEstablished()
+	if err := sm.KeySoftReset(); err != nil {
+		t.Fatalf("KeySoftReset: %v", err)
+	}
+	if got := sm.DataKeyID(); got != 0 {
+		t.Fatalf("DataKeyID()=%d, want 0 (lame duck)", got)
+	}
+
+	state := makeTestingStateAEAD()
+
+	dckOld := makeTestingDataChannelKey()
+	dckNew := makeTestingDataChannelKey()
+	dckNew.Local().PreMaster[0] ^= 0xFF // ensure distinct key material
+
+	kmOld := NewKeyMaterial(0)
+	if err := kmOld.DeriveKeys(dckOld, sm.LocalSessionID(), sm.RemoteSessionID(), state.dataCipher, state.hash, true); err != nil {
+		t.Fatalf("kmOld.DeriveKeys: %v", err)
+	}
+	kmNew := NewKeyMaterial(sm.CurrentKeyID())
+	if err := kmNew.DeriveKeys(dckNew, sm.LocalSessionID(), sm.RemoteSessionID(), state.dataCipher, state.hash, true); err != nil {
+		t.Fatalf("kmNew.DeriveKeys: %v", err)
+	}
+
+	// Simulate legacy fields being updated to the new primary key while the session still wants the lame duck key_id.
+	state.cipherKeyLocal = kmNew.GetCipherKeyLocal()
+	state.hmacKeyLocal = kmNew.GetHmacKeyLocal()
+	state.cipherKeyRemote = kmNew.GetCipherKeyRemote()
+	state.hmacKeyRemote = kmNew.GetHmacKeyRemote()
+	state.hmacLocal = kmNew.HmacLocal()
+	state.hmacRemote = kmNew.HmacRemote()
+	state.SetKeyMaterial(session.KS_PRIMARY, kmNew)
+	state.SetKeyMaterial(session.KS_LAME_DUCK, kmOld)
+
+	packetIDBytes := []byte{0x00, 0x00, 0x00, 0x01} // first outbound packet_id is 1
+
+	wantIV := make([]byte, 12)
+	copy(wantIV[:4], packetIDBytes)
+	hmacKeyLocal := kmOld.GetHmacKeyLocal()
+	copy(wantIV[4:], hmacKeyLocal[:8])
+
+	wantAAD := []byte{
+		byte((byte(model.P_DATA_V2) << 3) | (0 & 0x07)),
+		0x00, 0x00, 0x00, // peer-id defaults to 0 in tests
+		0x00, 0x00, 0x00, 0x01,
+	}
+
+	wantCipherKey := kmOld.GetCipherKeyLocal()
+	state.dataCipher = &testDataCipherAEAD{
+		t:       t,
+		wantKey: wantCipherKey[:],
+		wantIV:  wantIV,
+		wantAAD: wantAAD,
+	}
+
+	if _, err := encryptAndEncodePayloadAEAD(log.Log, []byte("x"), sm, state); err != nil {
+		t.Fatalf("encryptAndEncodePayloadAEAD: %v", err)
+	}
+}
+
+func Test_encryptAndEncodePayloadNonAEAD_MultiKeyUsesKeyMaterialMatchingDataKeyID(t *testing.T) {
+	sm := makeTestingSession()
+	sm.MarkPrimaryKeyEstablished()
+	if err := sm.KeySoftReset(); err != nil {
+		t.Fatalf("KeySoftReset: %v", err)
+	}
+	if got := sm.DataKeyID(); got != 0 {
+		t.Fatalf("DataKeyID()=%d, want 0 (lame duck)", got)
+	}
+
+	state := makeTestingStateNonAEAD()
+
+	dckOld := makeTestingDataChannelKey()
+	dckNew := makeTestingDataChannelKey()
+	dckNew.Local().PreMaster[0] ^= 0xFF // ensure distinct key material
+
+	kmOld := NewKeyMaterial(0)
+	if err := kmOld.DeriveKeys(dckOld, sm.LocalSessionID(), sm.RemoteSessionID(), state.dataCipher, state.hash, true); err != nil {
+		t.Fatalf("kmOld.DeriveKeys: %v", err)
+	}
+	kmNew := NewKeyMaterial(sm.CurrentKeyID())
+	if err := kmNew.DeriveKeys(dckNew, sm.LocalSessionID(), sm.RemoteSessionID(), state.dataCipher, state.hash, true); err != nil {
+		t.Fatalf("kmNew.DeriveKeys: %v", err)
+	}
+
+	// Simulate legacy fields being updated to the new primary key while the session still wants the lame duck key_id.
+	state.cipherKeyLocal = kmNew.GetCipherKeyLocal()
+	state.hmacKeyLocal = kmNew.GetHmacKeyLocal()
+	state.cipherKeyRemote = kmNew.GetCipherKeyRemote()
+	state.hmacKeyRemote = kmNew.GetHmacKeyRemote()
+	state.hmacLocal = kmNew.HmacLocal()
+	state.hmacRemote = kmNew.HmacRemote()
+	state.SetKeyMaterial(session.KS_PRIMARY, kmNew)
+	state.SetKeyMaterial(session.KS_LAME_DUCK, kmOld)
+
+	wantCipherKey := kmOld.GetCipherKeyLocal()
+	ciphertext := []byte{0xBB}
+
+	state.dataCipher = &testDataCipherNonAEAD{
+		t:       t,
+		wantKey: wantCipherKey[:],
+		out:     ciphertext,
+	}
+
+	oldGenRandomFn := genRandomFn
+	genRandomFn = func(i int) ([]byte, error) {
+		return bytes.Repeat([]byte{0x01}, i), nil
+	}
+	t.Cleanup(func() { genRandomFn = oldGenRandomFn })
+
+	got, err := encryptAndEncodePayloadNonAEAD(log.Log, bytes.Repeat([]byte{0xFF}, 16), sm, state)
+	if err != nil {
+		t.Fatalf("encryptAndEncodePayloadNonAEAD: %v", err)
+	}
+
+	iv := bytes.Repeat([]byte{0x01}, 16)
+	hk := kmOld.GetHmacKeyLocal()
+	m := hmac.New(sha1.New, hk[:20])
+	m.Write(iv)
+	m.Write(ciphertext)
+	wantMAC := m.Sum(nil)
+
+	// header (opcode+key_id) + peer-id (3) + mac (20) + iv (16) + ciphertext
+	if len(got) < 1+3+len(wantMAC)+len(iv)+len(ciphertext) {
+		t.Fatalf("unexpected output length: got %d", len(got))
+	}
+	if got[0] != byte((byte(model.P_DATA_V2)<<3)|(0&0x07)) {
+		t.Fatalf("header key_id mismatch: got 0x%02x", got[0])
+	}
+	macOff := 1 + 3
+	if !bytes.Equal(got[macOff:macOff+len(wantMAC)], wantMAC) {
+		t.Fatalf("mac mismatch")
+	}
+	ivOff := macOff + len(wantMAC)
+	if !bytes.Equal(got[ivOff:ivOff+len(iv)], iv) {
+		t.Fatalf("iv mismatch")
+	}
+}
+
 // Regression test for MIV-01-003
 func Test_Crash_EncryptAndEncodePayload(t *testing.T) {
 	t.Run("improperly initialized dataCipher should panic", func(t *testing.T) {
@@ -148,6 +289,58 @@ func Test_Crash_EncryptAndEncodePayload(t *testing.T) {
 		}
 		assertPanic(t, func() { dc.encryptAndEncodePayload(nil, dc.state) })
 	})
+}
+
+type testDataCipherAEAD struct {
+	t       *testing.T
+	wantKey []byte
+	wantIV  []byte
+	wantAAD []byte
+}
+
+func (c *testDataCipherAEAD) keySizeBytes() int      { return 16 }
+func (c *testDataCipherAEAD) isAEAD() bool           { return true }
+func (c *testDataCipherAEAD) blockSize() uint8       { return 16 }
+func (c *testDataCipherAEAD) cipherMode() cipherMode { return cipherModeGCM }
+func (c *testDataCipherAEAD) decrypt([]byte, *encryptedData) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *testDataCipherAEAD) encrypt(key []byte, pd *plaintextData) ([]byte, error) {
+	if !bytes.Equal(key, c.wantKey) {
+		c.t.Fatalf("encrypt key mismatch")
+	}
+	if !bytes.Equal(pd.iv, c.wantIV) {
+		c.t.Fatalf("iv mismatch: got %x, want %x", pd.iv, c.wantIV)
+	}
+	if !bytes.Equal(pd.aead, c.wantAAD) {
+		c.t.Fatalf("aead mismatch: got %x, want %x", pd.aead, c.wantAAD)
+	}
+	// Return ciphertext||tag (tag is last 16 bytes) as expected by the AEAD path.
+	ciphertext := []byte{0xCC}
+	tag := bytes.Repeat([]byte{0xDD}, 16)
+	return append(ciphertext, tag...), nil
+}
+
+type testDataCipherNonAEAD struct {
+	t       *testing.T
+	wantKey []byte
+	out     []byte
+}
+
+func (c *testDataCipherNonAEAD) keySizeBytes() int      { return 16 }
+func (c *testDataCipherNonAEAD) isAEAD() bool           { return false }
+func (c *testDataCipherNonAEAD) blockSize() uint8       { return 16 }
+func (c *testDataCipherNonAEAD) cipherMode() cipherMode { return cipherModeCBC }
+func (c *testDataCipherNonAEAD) decrypt([]byte, *encryptedData) ([]byte, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (c *testDataCipherNonAEAD) encrypt(key []byte, _ *plaintextData) ([]byte, error) {
+	if !bytes.Equal(key, c.wantKey) {
+		c.t.Fatalf("encrypt key mismatch")
+	}
+	return c.out, nil
 }
 
 type encryptEncodeFn func(model.Logger, []byte, *session.Manager, *dataChannelState) ([]byte, error)

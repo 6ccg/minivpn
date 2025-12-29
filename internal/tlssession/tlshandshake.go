@@ -3,10 +3,12 @@ package tlssession
 import (
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/asn1"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/ooni/minivpn/internal/runtimex"
@@ -199,8 +201,11 @@ func verifyX509Name(cert *x509.Certificate, expectedName string, verifyType conf
 	switch verifyType {
 	case config.VerifyX509SubjectDN:
 		// Match the complete Subject Distinguished Name
-		// OpenVPN format: "C=XX, ST=State, L=City, CN=Name"
-		subjectDN := formatSubjectDN(cert.Subject)
+		// OpenVPN format uses OpenSSL's X509_NAME_print_ex output (see .openvpn-ref).
+		subjectDN, err := formatSubjectDN(cert)
+		if err != nil {
+			return fmt.Errorf("%w: cannot format subject DN: %s", ErrX509NameMismatch, err)
+		}
 		if subjectDN != expectedName {
 			return fmt.Errorf("%w: subject DN %q does not match expected %q",
 				ErrX509NameMismatch, subjectDN, expectedName)
@@ -226,31 +231,91 @@ func verifyX509Name(cert *x509.Certificate, expectedName string, verifyType conf
 	return nil
 }
 
-// formatSubjectDN formats the certificate subject in OpenVPN-compatible format.
-// Example output: "C=KG, ST=NA, L=Bishkek, CN=Server-1"
-func formatSubjectDN(subject pkix.Name) string {
-	var parts []string
+// formatSubjectDN formats the certificate subject in an OpenVPN/OpenSSL-compatible format.
+//
+// It mimics OpenSSL's X509_NAME_print_ex with:
+// XN_FLAG_SEP_CPLUS_SPC | XN_FLAG_FN_SN | ASN1_STRFLGS_UTF8_CONVERT | ASN1_STRFLGS_ESC_CTRL.
+func formatSubjectDN(cert *x509.Certificate) (string, error) {
+	if cert == nil {
+		return "", errors.New("nil cert")
+	}
+	raw := cert.RawSubject
+	if len(raw) == 0 {
+		seq := cert.Subject.ToRDNSequence()
+		encoded, err := asn1.Marshal(seq)
+		if err != nil {
+			return "", err
+		}
+		raw = encoded
+	}
+	var rdns pkix.RDNSequence
+	if _, err := asn1.Unmarshal(raw, &rdns); err != nil {
+		return "", err
+	}
+	if len(rdns) == 0 {
+		return "", nil
+	}
 
-	for _, c := range subject.Country {
-		parts = append(parts, "C="+c)
+	rdnParts := make([]string, 0, len(rdns))
+	for _, rdn := range rdns {
+		if len(rdn) == 0 {
+			continue
+		}
+		avParts := make([]string, 0, len(rdn))
+		for _, atv := range rdn {
+			avParts = append(avParts, oidShortName(atv.Type)+"="+escapeDNValue(formatATVValue(atv.Value)))
+		}
+		rdnParts = append(rdnParts, strings.Join(avParts, " + "))
 	}
-	for _, st := range subject.Province {
-		parts = append(parts, "ST="+st)
-	}
-	for _, l := range subject.Locality {
-		parts = append(parts, "L="+l)
-	}
-	for _, o := range subject.Organization {
-		parts = append(parts, "O="+o)
-	}
-	for _, ou := range subject.OrganizationalUnit {
-		parts = append(parts, "OU="+ou)
-	}
-	if subject.CommonName != "" {
-		parts = append(parts, "CN="+subject.CommonName)
-	}
+	return strings.Join(rdnParts, ", "), nil
+}
 
-	return strings.Join(parts, ", ")
+var oidShortNames = map[string]string{
+	"2.5.4.6":                    "C",            // countryName
+	"2.5.4.8":                    "ST",           // stateOrProvinceName
+	"2.5.4.7":                    "L",            // localityName
+	"2.5.4.10":                   "O",            // organizationName
+	"2.5.4.11":                   "OU",           // organizationalUnitName
+	"2.5.4.3":                    "CN",           // commonName
+	"2.5.4.5":                    "serialNumber", // serialNumber
+	"2.5.4.9":                    "street",       // streetAddress
+	"2.5.4.17":                   "postalCode",   // postalCode
+	"1.2.840.113549.1.9.1":       "emailAddress", // pkcs9 emailAddress
+	"0.9.2342.19200300.100.1.25": "DC",           // domainComponent
+}
+
+func oidShortName(oid asn1.ObjectIdentifier) string {
+	if name, ok := oidShortNames[oid.String()]; ok {
+		return name
+	}
+	return oid.String()
+}
+
+func formatATVValue(v any) string {
+	switch vv := v.(type) {
+	case string:
+		return vv
+	case []byte:
+		return string(vv)
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+func escapeDNValue(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case r == '\\':
+			b.WriteString("\\\\")
+		case r <= 0x1f || r == 0x7f:
+			b.WriteString(fmt.Sprintf("\\x%02X", r))
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
 }
 
 // verifyKeyUsage verifies the certificate's Key Usage against the expected values.
@@ -258,6 +323,18 @@ func formatSubjectDN(subject pkix.Name) string {
 // The certificate must match at least one of the expected Key Usage values.
 func verifyKeyUsage(cert *x509.Certificate, expectedKUs []config.KeyUsage) error {
 	if len(expectedKUs) == 0 {
+		return nil
+	}
+
+	// OpenVPN 2.5 semantics: when --remote-cert-ku is specified with no args, or
+	// when --remote-cert-tls is used, the first KU is the OPENVPN_KU_REQUIRED
+	// sentinel (0xFFFF). In that case we only require the Key Usage extension to
+	// be present, but we don't check specific bits.
+	if expectedKUs[0] == config.KeyUsageRequired {
+		if !hasKeyUsageExtension(cert) {
+			return fmt.Errorf("%w: certificate does not have key usage extension",
+				ErrKeyUsageMismatch)
+		}
 		return nil
 	}
 
@@ -276,12 +353,37 @@ func verifyKeyUsage(cert *x509.Certificate, expectedKUs []config.KeyUsage) error
 		ErrKeyUsageMismatch, certKU)
 }
 
+var oidKeyUsage = asn1.ObjectIdentifier{2, 5, 29, 15}
+
+func hasKeyUsageExtension(cert *x509.Certificate) bool {
+	if cert == nil {
+		return false
+	}
+	for _, ext := range cert.Extensions {
+		if ext.Id.Equal(oidKeyUsage) {
+			return true
+		}
+	}
+	for _, ext := range cert.ExtraExtensions {
+		if ext.Id.Equal(oidKeyUsage) {
+			return true
+		}
+	}
+	return false
+}
+
 // verifyExtKeyUsage verifies the certificate's Extended Key Usage against the expected value.
 // This implements OpenVPN's --remote-cert-eku functionality.
 // The expected EKU can be a name (e.g., "serverAuth") or an OID (e.g., "1.3.6.1.5.5.7.3.1").
 func verifyExtKeyUsage(cert *x509.Certificate, expectedEKU string) error {
 	if expectedEKU == "" {
 		return nil
+	}
+
+	for _, eku := range cert.ExtKeyUsage {
+		if eku == x509.ExtKeyUsageAny {
+			return nil
+		}
 	}
 
 	// Map of common EKU names to x509.ExtKeyUsage values
@@ -324,9 +426,19 @@ func verifyExtKeyUsage(cert *x509.Certificate, expectedEKU string) error {
 		}
 	}
 
+	// If expectedEKU looks like an OID, also check UnknownExtKeyUsage.
 	if !found {
-		// Unknown EKU name/OID - we can't verify it
-		return fmt.Errorf("%w: unknown Extended Key Usage: %s", ErrExtKeyUsageMismatch, expectedEKU)
+		oid, ok := parseOID(expectedEKU)
+		if !ok {
+			return fmt.Errorf("%w: unknown Extended Key Usage: %s", ErrExtKeyUsageMismatch, expectedEKU)
+		}
+		for _, u := range cert.UnknownExtKeyUsage {
+			if u.Equal(oid) {
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: certificate does not have required Extended Key Usage: %s",
+			ErrExtKeyUsageMismatch, expectedEKU)
 	}
 
 	// Check if the certificate has the required EKU
@@ -342,6 +454,25 @@ func verifyExtKeyUsage(cert *x509.Certificate, expectedEKU string) error {
 
 	return fmt.Errorf("%w: certificate does not have required Extended Key Usage: %s",
 		ErrExtKeyUsageMismatch, expectedEKU)
+}
+
+func parseOID(s string) (asn1.ObjectIdentifier, bool) {
+	parts := strings.Split(s, ".")
+	if len(parts) < 2 {
+		return nil, false
+	}
+	out := make(asn1.ObjectIdentifier, 0, len(parts))
+	for _, part := range parts {
+		if part == "" {
+			return nil, false
+		}
+		value, err := strconv.Atoi(part)
+		if err != nil || value < 0 {
+			return nil, false
+		}
+		out = append(out, value)
+	}
+	return out, true
 }
 
 // initTLS returns a tls.Config matching the VPN options. Internally, it uses
@@ -419,11 +550,68 @@ func parrotTLSFactory(conn net.Conn, config *tls.Config) (handshaker, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: fingerprinting failed: %s", ErrBadParrot, err)
 	}
+	if err := applyTLSVersionMaxToClientHelloSpec(generatedSpec, config.MaxVersion); err != nil {
+		return nil, fmt.Errorf("%w: cannot apply tls-version-max: %s", ErrBadParrot, err)
+	}
 	client := tls.UClient(conn, config, tls.HelloCustom)
 	if err := client.ApplyPreset(generatedSpec); err != nil {
 		return nil, fmt.Errorf("%w: cannot apply spec: %s", ErrBadParrot, err)
 	}
 	return client, nil
+}
+
+func applyTLSVersionMaxToClientHelloSpec(spec *tls.ClientHelloSpec, maxVersion uint16) error {
+	if spec == nil || maxVersion == 0 || maxVersion >= tls.VersionTLS13 {
+		return nil
+	}
+
+	supportedVersionsFound := false
+	for _, ext := range spec.Extensions {
+		sve, ok := ext.(*tls.SupportedVersionsExtension)
+		if !ok {
+			continue
+		}
+		supportedVersionsFound = true
+
+		filtered := make([]uint16, 0, len(sve.Versions))
+		for _, v := range sve.Versions {
+			if isGreaseUint16(v) || v <= maxVersion {
+				filtered = append(filtered, v)
+			}
+		}
+		if !hasNonGreaseUint16(filtered) {
+			return fmt.Errorf("%w: no supported TLS versions after applying tls-version-max", ErrBadTLSInit)
+		}
+		sve.Versions = filtered
+	}
+
+	if supportedVersionsFound {
+		return nil
+	}
+
+	// If the spec has no SupportedVersionsExtension (e.g., a TLS 1.2 ClientHello),
+	// fall back to clamping TLSVersMax directly.
+	if spec.TLSVersMax == 0 || spec.TLSVersMax > maxVersion {
+		spec.TLSVersMax = maxVersion
+	}
+	if spec.TLSVersMin == 0 || spec.TLSVersMin > maxVersion {
+		spec.TLSVersMin = maxVersion
+	}
+	return nil
+}
+
+func isGreaseUint16(v uint16) bool {
+	// See RFC 8701 (GREASE) for the 0x?a?a pattern.
+	return (v&0x0f0f) == 0x0a0a && byte(v>>8) == byte(v)
+}
+
+func hasNonGreaseUint16(values []uint16) bool {
+	for _, v := range values {
+		if !isGreaseUint16(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // global variables to allow monkeypatching in tests.

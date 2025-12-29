@@ -49,6 +49,10 @@ var (
 
 	// ErrTimestampOutOfRange is returned when the packet timestamp is too far from local time.
 	ErrTimestampOutOfRange = errors.New("packet timestamp out of acceptable range")
+
+	// ErrTimeBacktrack is returned when the packet timestamp is older than the max seen timestamp.
+	// This matches OpenVPN's packet_id_test() behavior: "if (pin->time < p->time) return false;"
+	ErrTimeBacktrack = errors.New("time backtrack detected")
 )
 
 // packetIDAfter returns true if 'a' is considered to come after 'b' in the
@@ -239,7 +243,20 @@ func (f *Filter) checkTimestampLocked(timestamp model.PacketTimestamp, now int64
 
 // checkBacktrackModeLocked handles replay check for UDP mode (allows reordering).
 // Must be called with f.mu held.
+//
+// This implements OpenVPN's packet_id_test() for backtrack mode (packet_id.c:212-270):
+// - Allows out-of-order packets within the sequence window
+// - Rejects time-backtrack: packets with timestamp < maxTime are rejected
+// - When timestamp advances, the sequence window is effectively reset
 func (f *Filter) checkBacktrackModeLocked(id model.PacketID, timestamp model.PacketTimestamp, now int64) error {
+	// OpenVPN packet_id_test time-backtrack check (packet_id.c:252-258):
+	// "if (pin->time < p->time) return false;"
+	// This prevents accepting packets with timestamps older than what we've seen.
+	// Note: Only check if we have both a valid maxTime and incoming timestamp.
+	if timestamp > 0 && f.maxTime > 0 && timestamp < f.maxTime {
+		return ErrTimeBacktrack
+	}
+
 	// Case 1: New packet ID is ahead of maxID (using wraparound-safe comparison)
 	if packetIDAfter(id, f.maxID) {
 		shift := packetIDDiff(id, f.maxID)
@@ -253,8 +270,12 @@ func (f *Filter) checkBacktrackModeLocked(id model.PacketID, timestamp model.Pac
 		}
 
 		f.maxID = id
+		// OpenVPN packet_id_add behavior (packet_id.c:286-297):
+		// When pin->time > p->time, reset the sequence tracking for the new time period.
 		if timestamp > f.maxTime {
 			f.maxTime = timestamp
+			// When time advances, we could optionally reset the window here,
+			// but OpenVPN only does this for the base counter, not the full bitmap.
 		}
 		f.seqList[0] = now // mark new position as seen
 		return nil

@@ -288,3 +288,31 @@ func TestManager_LameDuckWakeup(t *testing.T) {
 		t.Errorf("LameDuckWakeup = %v, want ~30s", wakeup)
 	}
 }
+
+func TestManager_DataKeyID_SoftResetPrefersLameDuckUntilPrimaryEstablished(t *testing.T) {
+	m := newTestMultikeyManager(t)
+
+	// Simulate initial key establishment.
+	m.MarkPrimaryKeyEstablished()
+	if got := m.DataKeyID(); got != 0 {
+		t.Fatalf("DataKeyID() = %d, want 0 before rotation", got)
+	}
+
+	// Rotate keys (soft reset): key_id advances, but data key must remain on the
+	// established lame duck until the new primary is established.
+	if err := m.KeySoftReset(); err != nil {
+		t.Fatalf("KeySoftReset failed: %v", err)
+	}
+	if got := m.CurrentKeyID(); got == 0 {
+		t.Fatalf("CurrentKeyID() = %d, want non-zero after rotation", got)
+	}
+	if got := m.DataKeyID(); got != 0 {
+		t.Fatalf("DataKeyID() = %d, want 0 during rotation (lame duck)", got)
+	}
+
+	// When the new primary reaches S_GENERATED_KEYS, data key must switch.
+	m.MarkPrimaryKeyEstablished()
+	if got, want := m.DataKeyID(), m.CurrentKeyID(); got != want {
+		t.Fatalf("DataKeyID() = %d, want %d after primary established", got, want)
+	}
+}
