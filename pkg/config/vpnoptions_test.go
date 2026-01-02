@@ -2032,3 +2032,276 @@ func TestCompressionOpenVPN25Compliance(t *testing.T) {
 		}
 	})
 }
+
+func TestAuthNoCache_PurgeClearsAllCachedCredentials(t *testing.T) {
+	opts := &OpenVPNOptions{
+		AuthUserPass: true,
+		AuthNoCache:  true,
+		Username:     "user",
+		Password:     "pass",
+	}
+
+	u1, p1, err := opts.AuthUserPassSetup()
+	if err != nil {
+		t.Fatalf("AuthUserPassSetup() failed: %v", err)
+	}
+	if u1 != "user" || p1 != "pass" {
+		t.Fatalf("unexpected credentials: got %q/%q", u1, p1)
+	}
+
+	opts.PurgeAuthUserPass()
+
+	u2, p2, err := opts.AuthUserPassSetup()
+	if err == nil {
+		t.Fatalf("expected error after purge, got nil (creds=%q/%q)", u2, p2)
+	}
+	if !errors.Is(err, ErrBadConfig) {
+		t.Fatalf("expected ErrBadConfig, got %v", err)
+	}
+}
+
+func TestReadConfigFromBytes_AllowsInlineBlocks(t *testing.T) {
+	config := strings.Join([]string{
+		"remote 198.51.100.1 1194",
+		"proto udp4",
+		"<ca>",
+		"ca_string",
+		"</ca>",
+		"<cert>",
+		"cert_string",
+		"</cert>",
+		"<key>",
+		"key_string",
+		"</key>",
+		"",
+	}, "\n")
+
+	opts, err := ReadConfigFromBytes([]byte(config))
+	if err != nil {
+		t.Fatalf("ReadConfigFromBytes() failed: %v", err)
+	}
+	if len(opts.CA) == 0 || !strings.Contains(string(opts.CA), "ca_string") {
+		t.Fatalf("expected inline <ca> to be parsed")
+	}
+	if len(opts.Cert) == 0 || !strings.Contains(string(opts.Cert), "cert_string") {
+		t.Fatalf("expected inline <cert> to be parsed")
+	}
+	if len(opts.Key) == 0 || !strings.Contains(string(opts.Key), "key_string") {
+		t.Fatalf("expected inline <key> to be parsed")
+	}
+}
+
+func TestReadConfigFromBytes_RejectsFilePathArguments(t *testing.T) {
+	testcases := []struct {
+		name   string
+		config string
+	}{
+		{
+			name: "ca file path",
+			config: strings.Join([]string{
+				"ca ca.crt",
+				"<ca>",
+				"ca_string",
+				"</ca>",
+				"",
+			}, "\n"),
+		},
+		{
+			name: "cert file path",
+			config: strings.Join([]string{
+				"cert client.crt",
+				"<cert>",
+				"cert_string",
+				"</cert>",
+				"",
+			}, "\n"),
+		},
+		{
+			name: "key file path",
+			config: strings.Join([]string{
+				"key client.key",
+				"<key>",
+				"key_string",
+				"</key>",
+				"",
+			}, "\n"),
+		},
+		{
+			name: "tls-auth file path",
+			config: strings.Join([]string{
+				"tls-auth ta.key 1",
+				"<tls-auth>",
+				"ta_string",
+				"</tls-auth>",
+				"",
+			}, "\n"),
+		},
+		{
+			name: "tls-crypt file path",
+			config: strings.Join([]string{
+				"tls-crypt tc.key",
+				"<tls-crypt>",
+				"tc_string",
+				"</tls-crypt>",
+				"",
+			}, "\n"),
+		},
+		{
+			name: "tls-crypt-v2 file path",
+			config: strings.Join([]string{
+				"tls-crypt-v2 tc-v2.key",
+				"<tls-crypt-v2>",
+				"tc_v2_string",
+				"</tls-crypt-v2>",
+				"",
+			}, "\n"),
+		},
+		{
+			name: "auth-user-pass file path",
+			config: strings.Join([]string{
+				"auth-user-pass auth.txt",
+				"",
+			}, "\n"),
+		},
+	}
+
+	for _, tt := range testcases {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ReadConfigFromBytes([]byte(tt.config))
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+			if !errors.Is(err, ErrBadConfig) {
+				t.Fatalf("expected ErrBadConfig, got %v", err)
+			}
+		})
+	}
+}
+
+func TestReadConfigFromBytes_AuthUserPassInjected(t *testing.T) {
+	config := strings.Join([]string{
+		"remote 198.51.100.1 1194",
+		"proto udp4",
+		"auth-user-pass",
+		"<ca>",
+		"ca_string",
+		"</ca>",
+		"",
+	}, "\n")
+
+	opts, err := ReadConfigFromBytes([]byte(config))
+	if err != nil {
+		t.Fatalf("ReadConfigFromBytes() failed: %v", err)
+	}
+	if !opts.AuthUserPass {
+		t.Fatalf("expected AuthUserPass=true")
+	}
+	if opts.Username != "" || opts.Password != "" {
+		t.Fatalf("expected empty injected credentials before override")
+	}
+
+	opts.Username = "user"
+	opts.Password = "pass"
+
+	if !opts.HasAuthInfo() {
+		t.Fatalf("expected HasAuthInfo() after injecting username/password")
+	}
+
+	u, p, err := opts.AuthUserPassSetup()
+	if err != nil {
+		t.Fatalf("AuthUserPassSetup() failed: %v", err)
+	}
+	if u != "user" || p != "pass" {
+		t.Fatalf("unexpected credentials: got %q/%q", u, p)
+	}
+}package config
+
+func TestReadConfigFromString_AllowsInlineCA(t *testing.T) {
+	cfg := `
+proto udp
+remote 1.2.3.4 1194
+<ca>
+dummy-ca
+</ca>
+`
+	o, err := ReadConfigFromString(cfg)
+	if err != nil {
+		t.Fatalf("ReadConfigFromString: %v", err)
+	}
+	if len(o.CA) == 0 {
+		t.Fatalf("expected CA bytes from inline <ca> block")
+	}
+}
+
+func TestReadConfigFromString_RejectsFilePathParameters(t *testing.T) {
+	testcases := []struct {
+		name string
+		cfg  string
+	}{
+		{"ca", "ca ca.pem\n"},
+		{"cert", "cert client.crt\n"},
+		{"key", "key client.key\n"},
+		{"tls-auth", "tls-auth ta.key\n"},
+		{"tls-crypt", "tls-crypt tc.key\n"},
+		{"tls-crypt-v2", "tls-crypt-v2 tc2.key\n"},
+		{"auth-user-pass", "auth-user-pass creds.txt\n"},
+		// OpenVPN 2.5.x directives that reference external files must be rejected
+		// (we only support inline crypto/credentials blocks).
+		{"pkcs12", "pkcs12 client.p12\n"},
+		{"crl-verify", "crl-verify crl.pem\n"},
+		{"dh", "dh dh.pem\n"},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := ReadConfigFromString(tc.cfg)
+			if err == nil {
+				t.Fatalf("expected error, got nil")
+			}
+		})
+	}
+}
+
+func TestHasAuthInfo_AllowsUpperLayerCredentialInjection(t *testing.T) {
+	cfg := `
+proto udp
+remote 1.2.3.4 1194
+auth-user-pass
+<ca>
+dummy-ca
+</ca>
+`
+	o, err := ReadConfigFromString(cfg)
+	if err != nil {
+		t.Fatalf("ReadConfigFromString: %v", err)
+	}
+	if o.HasAuthInfo() {
+		t.Fatalf("expected HasAuthInfo() to be false before injecting credentials")
+	}
+	o.Username = "user"
+	o.Password = "pass"
+	if !o.HasAuthInfo() {
+		t.Fatalf("expected HasAuthInfo() to be true after injecting credentials")
+	}
+}
+
+func TestReadConfigFromBytes_UnknownOptionIsFatal(t *testing.T) {
+	_, err := ReadConfigFromBytes([]byte("this-option-does-not-exist foo\n"))
+	if err == nil {
+		t.Fatalf("expected error, got nil")
+	}
+	if !errors.Is(err, ErrBadConfig) {
+		t.Fatalf("expected ErrBadConfig, got %v", err)
+	}
+}
+
+func TestReadConfigFromBytes_IgnoreUnknownOptionAllowsListed(t *testing.T) {
+	config := strings.Join([]string{
+		"ignore-unknown-option this-option-does-not-exist",
+		"this-option-does-not-exist foo",
+		"",
+	}, "\n")
+	if _, err := ReadConfigFromBytes([]byte(config)); err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+}

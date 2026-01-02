@@ -1031,3 +1031,68 @@ func Test_customVerifyWithX509Name(t *testing.T) {
 		}
 	})
 }
+
+func TestFormatSubjectDN_IncludesExtraNames(t *testing.T) {
+	rdns := pkix.RDNSequence{
+		pkix.RelativeDistinguishedNameSET{
+			pkix.AttributeTypeAndValue{Type: asn1.ObjectIdentifier{2, 5, 4, 6}, Value: "US"},
+		},
+		pkix.RelativeDistinguishedNameSET{
+			pkix.AttributeTypeAndValue{Type: asn1.ObjectIdentifier{2, 5, 4, 3}, Value: "test-server"},
+		},
+		pkix.RelativeDistinguishedNameSET{
+			pkix.AttributeTypeAndValue{Type: asn1.ObjectIdentifier{1, 2, 3, 4}, Value: "extra"},
+		},
+	}
+	raw, err := asn1.Marshal(rdns)
+	if err != nil {
+		t.Fatalf("asn1.Marshal(RDNSequence) failed: %v", err)
+	}
+	got, err := formatSubjectDN(&x509.Certificate{RawSubject: raw})
+	if err != nil {
+		t.Fatalf("formatSubjectDN() failed: %v", err)
+	}
+	if !strings.Contains(got, "1.2.3.4=extra") {
+		t.Fatalf("expected DN to include ExtraNames, got %q", got)
+	}
+}
+
+func Test_verifyExtKeyUsage_CustomOIDMatchesUnknownExtKeyUsage(t *testing.T) {
+	cert := &x509.Certificate{
+		UnknownExtKeyUsage: []asn1.ObjectIdentifier{
+			{1, 2, 3, 4, 5},
+		},
+	}
+
+	if oid, ok := parseOID("1.2.3.4.5"); !ok {
+		t.Fatalf("parseOID: expected ok=true")
+	} else if oid.String() != "1.2.3.4.5" {
+		t.Fatalf("parseOID: expected oid=1.2.3.4.5, got %q", oid.String())
+	}
+
+	if err := verifyExtKeyUsage(cert, "1.2.3.4.5"); err != nil {
+		t.Fatalf("verifyExtKeyUsage: %v", err)
+	}
+}
+
+func TestVerifyKeyUsage_KeyUsageRequiredSentinel(t *testing.T) {
+	t.Run("missing key usage extension fails", func(t *testing.T) {
+		cert := &x509.Certificate{}
+		err := verifyKeyUsage(cert, []config.KeyUsage{config.KeyUsageRequired})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("present key usage extension passes", func(t *testing.T) {
+		cert := &x509.Certificate{
+			Extensions: []pkix.Extension{
+				{Id: asn1.ObjectIdentifier{2, 5, 29, 15}},
+			},
+		}
+		err := verifyKeyUsage(cert, []config.KeyUsage{config.KeyUsageRequired})
+		if err != nil {
+			t.Fatalf("verifyKeyUsage: %v", err)
+		}
+	})
+}

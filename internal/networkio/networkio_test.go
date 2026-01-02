@@ -3,13 +3,122 @@ package networkio
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net"
 	"testing"
 
 	"github.com/apex/log"
 	"github.com/ooni/minivpn/internal/bytespool"
+	"github.com/ooni/minivpn/internal/runtimex"
 	"github.com/ooni/minivpn/internal/vpntest"
+	"github.com/ooni/minivpn/internal/workers"
+	"github.com/ooni/minivpn/pkg/config"
 )
+
+// mockedConn is a test helper for simulating network connections.
+type mockedConn struct {
+	conn    *vpntest.Conn
+	dataIn  [][]byte
+	dataOut [][]byte
+}
+
+func (mc *mockedConn) NetworkReads() [][]byte {
+	return mc.dataOut
+}
+
+func (mc *mockedConn) NetworkWrites() [][]byte {
+	return mc.dataIn
+}
+
+func newDialer(underlying *mockedConn) *vpntest.Dialer {
+	dialer := &vpntest.Dialer{
+		MockDialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return underlying.conn, nil
+		},
+	}
+	return dialer
+}
+
+func newMockedConn(network string, dataIn, dataOut [][]byte) *mockedConn {
+	conn := &mockedConn{
+		dataIn:  dataIn,
+		dataOut: dataOut,
+	}
+	conn.conn = &vpntest.Conn{
+		MockLocalAddr: func() net.Addr {
+			addr := &vpntest.Addr{
+				MockString:  func() string { return "1.2.3.4" },
+				MockNetwork: func() string { return network },
+			}
+			return addr
+		},
+		MockRead: func(b []byte) (int, error) {
+			if len(conn.dataOut) > 0 {
+				copy(b[:], conn.dataOut[0])
+				ln := len(conn.dataOut[0])
+				conn.dataOut = conn.dataOut[1:]
+				return ln, nil
+			}
+			return 0, errors.New("EOF")
+		},
+		MockWrite: func(b []byte) (int, error) {
+			conn.dataIn = append(conn.dataIn, b)
+			return len(b), nil
+		},
+	}
+	return conn
+}
+
+// TestService_StartStopWorkers tests that we can initialize, start and stop the networkio workers.
+func TestService_StartStopWorkers(t *testing.T) {
+	if testing.Verbose() {
+		log.SetLevel(log.DebugLevel)
+	}
+	workersManager := workers.NewManager(log.Log)
+
+	wantToRead := []byte("deadbeef")
+
+	dataIn := make([][]byte, 0)
+
+	// out is out of the network (i.e., incoming data, reads)
+	dataOut := make([][]byte, 0)
+	dataOut = append(dataOut, wantToRead)
+
+	underlying := newMockedConn("udp", dataIn, dataOut)
+	testDialer := newDialer(underlying)
+	dialer := NewDialer(log.Log, testDialer)
+
+	framingConn, err := dialer.DialContext(context.Background(), "udp", "1.1.1.1")
+	runtimex.PanicOnError(err, "should not error on getting new context")
+
+	muxerToNetwork := make(chan []byte, 1024)
+	networkToMuxer := make(chan []byte, 1024)
+	muxerToNetwork <- []byte("AABBCCDD")
+
+	s := Service{
+		MuxerToNetwork: muxerToNetwork,
+		NetworkToMuxer: &networkToMuxer,
+	}
+
+	s.StartWorkers(config.NewConfig(config.WithLogger(log.Log)), workersManager, framingConn)
+	got := <-networkToMuxer
+
+	workersManager.StartShutdown()
+	workersManager.WaitWorkersShutdown()
+
+	if !bytes.Equal(got, wantToRead) {
+		t.Errorf("expected word %s in networkToMuxer, got %s", wantToRead, got)
+	}
+
+	networkWrites := underlying.NetworkWrites()
+	if len(networkWrites) == 0 {
+		t.Errorf("expected network writes")
+		return
+	}
+	if !bytes.Equal(networkWrites[0], []byte("AABBCCDD")) {
+		t.Errorf("network writes do not match")
+	}
+}
 
 func Test_TCPLikeConn(t *testing.T) {
 	t.Run("A tcp-like conn implements the openvpn size framing", func(t *testing.T) {
