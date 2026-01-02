@@ -1,4 +1,4 @@
-module github.com/ooni/minivpn
+module github.com/6ccg/minivpn
 
 go 1.20
 
