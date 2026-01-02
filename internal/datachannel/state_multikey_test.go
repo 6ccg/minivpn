@@ -3,7 +3,7 @@ package datachannel
 import (
 	"testing"
 
-	"github.com/ooni/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/session"
 )
 
 func TestDataChannelState_GetKeyMaterialByID(t *testing.T) {

@@ -3,7 +3,7 @@ package networkio
 import (
 	"context"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 // Dialer dials network connections. The zero value of this structure is

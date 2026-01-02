@@ -8,13 +8,13 @@ import (
 	"log"
 	"time"
 
-	"github.com/ooni/minivpn/internal/bytespool"
-	"github.com/ooni/minivpn/internal/bytesx"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/internal/wire"
-	"github.com/ooni/minivpn/internal/workers"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/bytespool"
+	"github.com/6ccg/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/wire"
+	"github.com/6ccg/minivpn/internal/workers"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 // debugWireEnabled checks if wire-level debug is enabled
@@ -57,7 +57,7 @@ type Service struct {
 // StartWorkers starts the packet-muxer workers. See the [ARCHITECTURE]
 // file for more information about the packet-muxer workers.
 //
-// [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
+// [ARCHITECTURE]: https://github.com/6ccg/minivpn/blob/main/ARCHITECTURE.md
 func (s *Service) StartWorkers(
 	config *config.Config,
 	workersManager *workers.Manager,
@@ -256,7 +256,7 @@ func (ws *workersState) moveDownWorker() {
 			}
 
 			// POSSIBLY BLOCK on writing the packet to the networkio layer.
-			// [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
+			// [ARCHITECTURE]: https://github.com/6ccg/minivpn/blob/main/ARCHITECTURE.md
 
 			select {
 			case ws.muxerToNetwork <- rawPacket:

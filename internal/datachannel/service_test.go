@@ -6,10 +6,10 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/internal/workers"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/workers"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 type lockedLogger struct {

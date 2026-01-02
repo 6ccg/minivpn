@@ -5,11 +5,11 @@ package controlchannel
 import (
 	"fmt"
 
-	"github.com/ooni/minivpn/internal/bytesx"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/internal/workers"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/workers"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 var (
@@ -38,7 +38,7 @@ type Service struct {
 // StartWorkers starts the control-channel workers. See the [ARCHITECTURE]
 // file for more information about the packet-muxer workers.
 //
-// [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
+// [ARCHITECTURE]: https://github.com/6ccg/minivpn/blob/main/ARCHITECTURE.md
 func (svc *Service) StartWorkers(
 	config *config.Config,
 	workersManager *workers.Manager,

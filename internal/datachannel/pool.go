@@ -8,7 +8,7 @@ import (
 	"bytes"
 	"sync"
 
-	"github.com/ooni/minivpn/internal/bytespool"
+	"github.com/6ccg/minivpn/internal/bytespool"
 )
 
 // bufferPool pools bytes.Buffer instances for small header buffers

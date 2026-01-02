@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/ooni/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/bytesx"
 )
 
 // randomFn mocks the function to generate random bytes.

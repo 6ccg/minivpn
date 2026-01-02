@@ -16,8 +16,8 @@ import (
 	"hash"
 	"log"
 
-	"github.com/ooni/minivpn/internal/bytesx"
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/model"
 	"golang.org/x/crypto/chacha20poly1305"
 ) //#nosec G501,G505
 //  We know that sha1 and md5 are insecure, but we do not control the openvpn protocol.

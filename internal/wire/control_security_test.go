@@ -10,7 +10,7 @@ import (
 	"encoding/hex"
 	"testing"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 const keyData = `-----BEGIN OpenVPN Static key V1-----

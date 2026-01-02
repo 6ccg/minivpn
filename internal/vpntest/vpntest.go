@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 // TestPacket is used to simulate incoming packets over the network. The goal is to be able to

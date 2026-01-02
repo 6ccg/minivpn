@@ -7,11 +7,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/runtimex"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/internal/vpntest"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/vpntest"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 func makeTestingSession() *session.Manager {

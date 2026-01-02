@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 // Fragment types (compatible with OpenVPN 2.5)

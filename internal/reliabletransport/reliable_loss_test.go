@@ -5,9 +5,9 @@ import (
 	"time"
 
 	"github.com/apex/log"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/vpntest"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/vpntest"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 // test that everything that is sent eventually arrives in bounded time, in the pressence of losses.

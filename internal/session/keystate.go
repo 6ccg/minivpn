@@ -3,7 +3,7 @@ package session
 import (
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 // Key slot constants matching OpenVPN's ssl_common.h

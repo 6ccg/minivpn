@@ -8,7 +8,7 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 // ErrShutdown is the error returned by a worker that is shutting down.

@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/optional"
-	"github.com/ooni/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/optional"
+	"github.com/6ccg/minivpn/internal/session"
 )
 
 // moveUpWorker moves packets up the stack (receiver).

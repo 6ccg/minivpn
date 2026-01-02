@@ -4,7 +4,7 @@ import (
 	"math"
 	"net"
 
-	"github.com/ooni/minivpn/internal/bytespool"
+	"github.com/6ccg/minivpn/internal/bytespool"
 )
 
 // datagramConn wraps a datagram socket and implements OpenVPN framing.

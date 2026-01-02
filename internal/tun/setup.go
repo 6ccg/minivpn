@@ -1,17 +1,17 @@
 package tun
 
 import (
-	"github.com/ooni/minivpn/internal/controlchannel"
-	"github.com/ooni/minivpn/internal/datachannel"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/networkio"
-	"github.com/ooni/minivpn/internal/packetmuxer"
-	"github.com/ooni/minivpn/internal/reliabletransport"
-	"github.com/ooni/minivpn/internal/runtimex"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/internal/tlssession"
-	"github.com/ooni/minivpn/internal/workers"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/controlchannel"
+	"github.com/6ccg/minivpn/internal/datachannel"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/networkio"
+	"github.com/6ccg/minivpn/internal/packetmuxer"
+	"github.com/6ccg/minivpn/internal/reliabletransport"
+	"github.com/6ccg/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/tlssession"
+	"github.com/6ccg/minivpn/internal/workers"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 // Channel buffer sizes for high-frequency data paths.
@@ -39,7 +39,7 @@ func connectChannel[T any](signal chan T, slot **chan T) {
 // startWorkers starts all the workers.  See the [ARCHITECTURE]
 // file for more information about the workers.
 //
-// [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
+// [ARCHITECTURE]: https://github.com/6ccg/minivpn/blob/main/ARCHITECTURE.md
 func startWorkers(config *config.Config, conn networkio.FramingConn,
 	sessionManager *session.Manager, tunDevice *TUN) *workers.Manager {
 

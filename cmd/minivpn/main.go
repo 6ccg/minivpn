@@ -14,11 +14,11 @@ import (
 	"github.com/apex/log"
 	"github.com/jackpal/gateway"
 
-	"github.com/ooni/minivpn/extras/ping"
-	"github.com/ooni/minivpn/internal/runtimex"
-	"github.com/ooni/minivpn/pkg/config"
-	"github.com/ooni/minivpn/pkg/tracex"
-	"github.com/ooni/minivpn/pkg/tunnel"
+	"github.com/6ccg/minivpn/extras/ping"
+	"github.com/6ccg/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/pkg/tracex"
+	"github.com/6ccg/minivpn/pkg/tunnel"
 )
 
 func runCmd(binaryPath string, args ...string) {

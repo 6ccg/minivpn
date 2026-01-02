@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 func Test_inFlightPacket_backoff(t *testing.T) {

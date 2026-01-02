@@ -9,12 +9,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/optional"
-	"github.com/ooni/minivpn/internal/replay"
-	"github.com/ooni/minivpn/internal/runtimex"
-	"github.com/ooni/minivpn/internal/wire"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/optional"
+	"github.com/6ccg/minivpn/internal/replay"
+	"github.com/6ccg/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/internal/wire"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 var (

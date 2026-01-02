@@ -4,8 +4,8 @@ import (
 	"hash"
 	"sync"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
 )
 
 // keySlot holds the different local and remote keys.

@@ -5,7 +5,7 @@ package tracex
 import (
 	"testing"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 func Test_maybeAddTagsFromPacket(t *testing.T) {

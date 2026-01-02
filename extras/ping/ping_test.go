@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ooni/minivpn/internal/mocks"
+	"github.com/6ccg/minivpn/internal/mocks"
 
 	"github.com/google/uuid"
 	"golang.org/x/net/icmp"

@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/apex/log"
-	"github.com/ooni/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/session"
 )
 
 func Test_decodeEncryptedPayloadAEAD(t *testing.T) {

@@ -4,8 +4,8 @@ import (
 	"net"
 
 	"github.com/apex/log"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/runtimex"
 )
 
 // Config contains options to initialize the OpenVPN tunnel.

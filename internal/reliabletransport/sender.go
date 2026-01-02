@@ -6,8 +6,8 @@ import (
 	"sort"
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/optional"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/optional"
 )
 
 var (

@@ -7,7 +7,7 @@ import (
 	"math"
 	"net"
 
-	"github.com/ooni/minivpn/internal/bytespool"
+	"github.com/6ccg/minivpn/internal/bytespool"
 )
 
 // streamConn wraps a stream socket and implements OpenVPN framing.

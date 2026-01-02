@@ -8,9 +8,9 @@ import (
 	"github.com/apex/log"
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 func TestNewDataChannelFromOptions(t *testing.T) {

@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"reflect"
 
-	"github.com/ooni/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/internal/runtimex"
 )
 
 // Value is an optional value. The zero value of this structure

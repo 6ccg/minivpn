@@ -8,11 +8,11 @@ import (
 	"testing"
 
 	"github.com/apex/log"
-	"github.com/ooni/minivpn/internal/bytespool"
-	"github.com/ooni/minivpn/internal/runtimex"
-	"github.com/ooni/minivpn/internal/vpntest"
-	"github.com/ooni/minivpn/internal/workers"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/bytespool"
+	"github.com/6ccg/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/internal/vpntest"
+	"github.com/6ccg/minivpn/internal/workers"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 // mockedConn is a test helper for simulating network connections.

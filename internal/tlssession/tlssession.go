@@ -10,11 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/ooni/minivpn/internal/bytesx"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/internal/workers"
-	vpnconfig "github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/workers"
+	vpnconfig "github.com/6ccg/minivpn/pkg/config"
 
 	tls "github.com/refraction-networking/utls"
 )
@@ -79,7 +79,7 @@ type Service struct {
 // StartWorkers starts the tlssession workers. See the [ARCHITECTURE]
 // file for more information about the packet-muxer workers.
 //
-// [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
+// [ARCHITECTURE]: https://github.com/6ccg/minivpn/blob/main/ARCHITECTURE.md
 func (svc *Service) StartWorkers(
 	config *vpnconfig.Config,
 	workersManager *workers.Manager,

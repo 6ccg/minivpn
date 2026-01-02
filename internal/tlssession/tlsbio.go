@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ooni/minivpn/internal/bytesx"
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 // tlsBio allows to use channels to read and write

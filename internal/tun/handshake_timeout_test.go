@@ -8,9 +8,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
-	vpnconfig "github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
+	vpnconfig "github.com/6ccg/minivpn/pkg/config"
 )
 
 type blockingFramingConn struct {

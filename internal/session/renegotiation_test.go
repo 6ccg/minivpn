@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 // mockLogger implements model.Logger for testing

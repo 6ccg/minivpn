@@ -1,10 +1,10 @@
 package reliabletransport
 
 import (
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/internal/workers"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/workers"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 var (
@@ -30,7 +30,7 @@ type Service struct {
 // StartWorkers starts the reliable-transport workers. See the [ARCHITECTURE]
 // file for more information about the reliable-transport workers.
 //
-// [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
+// [ARCHITECTURE]: https://github.com/6ccg/minivpn/blob/main/ARCHITECTURE.md
 func (s *Service) StartWorkers(
 	config *config.Config,
 	workersManager *workers.Manager,

@@ -12,7 +12,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/ooni/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/bytesx"
 )
 
 func Test_dataCipherAES_decrypt(t *testing.T) {

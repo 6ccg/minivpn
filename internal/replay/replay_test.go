@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 func TestFilter_Check_RejectsZeroID(t *testing.T) {

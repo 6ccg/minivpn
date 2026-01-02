@@ -8,9 +8,9 @@ import (
 	"os"
 	"syscall"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/workers"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/workers"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 var (
@@ -83,7 +83,7 @@ type Service struct {
 // StartWorkers starts the network I/O workers. See the [ARCHITECTURE]
 // file for more information about the network I/O workers.
 //
-// [ARCHITECTURE]: https://github.com/ooni/minivpn/blob/main/ARCHITECTURE.md
+// [ARCHITECTURE]: https://github.com/6ccg/minivpn/blob/main/ARCHITECTURE.md
 func (svc *Service) StartWorkers(
 	config *config.Config,
 	manager *workers.Manager,

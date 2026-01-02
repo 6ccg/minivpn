@@ -3,8 +3,8 @@ package reliabletransport
 import (
 	"time"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/optional"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/optional"
 )
 
 // inFlightPacket wraps a [model.Packet] with metadata for retransmission.

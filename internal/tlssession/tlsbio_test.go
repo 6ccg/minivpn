@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/apex/log"
-	"github.com/ooni/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/internal/runtimex"
 )
 
 func Test_tlsBio(t *testing.T) {

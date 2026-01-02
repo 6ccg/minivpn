@@ -19,7 +19,7 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/ooni/minivpn/vpn"
+	"github.com/6ccg/minivpn/vpn"
 
 	"runtime"
 	"runtime/pprof"

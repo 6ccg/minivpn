@@ -6,9 +6,9 @@ import (
 	"net"
 
 	"github.com/apex/log"
-	"github.com/ooni/minivpn/internal/networkio"
-	"github.com/ooni/minivpn/internal/tun"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/networkio"
+	"github.com/6ccg/minivpn/internal/tun"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 // SimpleDialer establishes network connections.

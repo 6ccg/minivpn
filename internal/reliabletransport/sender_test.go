@@ -6,8 +6,8 @@ import (
 	"time"
 
 	"github.com/apex/log"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/optional"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/optional"
 
 	// TODO: replace with stdlib slices after 1.21
 	"golang.org/x/exp/slices"

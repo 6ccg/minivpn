@@ -19,10 +19,10 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/ooni/minivpn/internal/bytesx"
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 // encodeClientControlMessage returns a byte array with the payload for a control channel packet.

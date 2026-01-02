@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 func TestPingConfig(t *testing.T) {

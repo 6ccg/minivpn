@@ -10,8 +10,8 @@ import (
 	"log"
 	"math"
 
-	"github.com/ooni/minivpn/internal/bytesx"
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 // ErrEmptyPayload indicates tha the payload of an OpenVPN control packet is empty.

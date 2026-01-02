@@ -3,7 +3,7 @@ package datachannel
 import (
 	"testing"
 
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 func TestReplayFilter_Sequential(t *testing.T) {

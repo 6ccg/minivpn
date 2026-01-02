@@ -19,7 +19,7 @@ import (
 	"io"
 	"math"
 
-	"github.com/ooni/minivpn/internal/runtimex"
+	"github.com/6ccg/minivpn/internal/runtimex"
 )
 
 var (

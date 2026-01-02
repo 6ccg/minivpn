@@ -14,10 +14,10 @@ import (
 	"github.com/ory/dockertest/v3"
 	dc "github.com/ory/dockertest/v3/docker"
 
-	"github.com/ooni/minivpn/extras/ping"
-	"github.com/ooni/minivpn/internal/networkio"
-	"github.com/ooni/minivpn/internal/tun"
-	"github.com/ooni/minivpn/pkg/config"
+	"github.com/6ccg/minivpn/extras/ping"
+	"github.com/6ccg/minivpn/internal/networkio"
+	"github.com/6ccg/minivpn/internal/tun"
+	"github.com/6ccg/minivpn/pkg/config"
 )
 
 const (

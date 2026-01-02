@@ -1,7 +1,7 @@
 package reliabletransport
 
 import (
-	"github.com/ooni/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/model"
 )
 
 type outgoingPacketWriter interface {

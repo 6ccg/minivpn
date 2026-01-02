@@ -5,8 +5,8 @@ import (
 	"hash"
 	"sync"
 
-	"github.com/ooni/minivpn/internal/model"
-	"github.com/ooni/minivpn/internal/session"
+	"github.com/6ccg/minivpn/internal/model"
+	"github.com/6ccg/minivpn/internal/session"
 )
 
 // KeyMaterial holds the derived cryptographic keys for a single data channel key.

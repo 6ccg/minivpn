@@ -13,7 +13,7 @@ import (
 	"io"
 	"math"
 
-	"github.com/ooni/minivpn/internal/bytesx"
+	"github.com/6ccg/minivpn/internal/bytesx"
 )
 
 // Opcode is an OpenVPN packet opcode.
